@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -19,16 +19,14 @@ import {
   normalizeCustomPublicUrl,
   promptTunnelSelection,
 } from "../src/tunnel-selector.ts";
+import { makeMockCli } from "./helpers/mock-cli.ts";
 
 const tempDirs: string[] = [];
 
-function makeTempScript(filename: string, content: string): string {
+function makeTempScript(filename: string, jsBody: string): string {
   const dir = mkdtempSync(join(tmpdir(), "gemination-tunnel-test-"));
   tempDirs.push(dir);
-  const scriptPath = join(dir, filename);
-  writeFileSync(scriptPath, content, "utf8");
-  chmodSync(scriptPath, 0o755);
-  return scriptPath;
+  return makeMockCli(dir, filename, jsBody);
 }
 
 afterEach(() => {
@@ -85,26 +83,28 @@ describe("Tailscale status & URL helpers", () => {
   });
 
   test("findTailscaleBinary honors TAILSCALE_BIN override", () => {
-    const fakeBin = makeTempScript("fake-tailscale", "#!/usr/bin/env bash\nexit 0\n");
+    const fakeBin = makeTempScript("fake-tailscale", "process.exit(0);\n");
     expect(findTailscaleBinary({ TAILSCALE_BIN: fakeBin })).toBe(fakeBin);
   });
 
   test("startTailscaleFunnel resolves funnel URL and cleans up cleanly", async () => {
     const fakeTailscale = makeTempScript(
-      "tailscale-ok.sh",
-      `#!/usr/bin/env bash
-if [ "$1" = "status" ]; then
-  echo '{"BackendState":"Running","Self":{"DNSName":"mock-mac.tail999.ts.net.","CapMap":{"https":[]}}}'
-  exit 0
-fi
-if [ "$1" = "funnel" ]; then
-  echo "Available on the internet:"
-  echo "https://mock-mac.tail999.ts.net/"
-  echo "|-- proxy $3"
-  trap 'exit 0' INT TERM
-  while true; do sleep 1; done
-fi
-exit 1
+      "tailscale-ok",
+      `const cmd = process.argv[2];
+if (cmd === "status") {
+  console.log('{"BackendState":"Running","Self":{"DNSName":"mock-mac.tail999.ts.net.","CapMap":{"https":[]}}}');
+  process.exit(0);
+}
+if (cmd === "funnel") {
+  console.log("Available on the internet:");
+  console.log("https://mock-mac.tail999.ts.net/");
+  console.log("|-- proxy " + (process.argv[4] ?? ""));
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else {
+  process.exit(1);
+}
 `,
     );
 
@@ -123,21 +123,23 @@ exit 1
 
   test("startTailscaleFunnel surfaces admin enable URL notice before funnel URL arrives", async () => {
     const fakeTailscale = makeTempScript(
-      "tailscale-activate.sh",
-      `#!/usr/bin/env bash
-if [ "$1" = "status" ]; then
-  echo '{"BackendState":"Running","Self":{"DNSName":"activate-mac.tail999.ts.net.","CapMap":{"https":[]}}}'
-  exit 0
-fi
-if [ "$1" = "funnel" ]; then
-  echo "Funnel is not enabled on your tailnet."
-  echo "To enable, visit https://login.tailscale.com/f/funnel?node=n123"
-  sleep 0.1
-  echo "https://activate-mac.tail999.ts.net/"
-  trap 'exit 0' INT TERM
-  while true; do sleep 1; done
-fi
-exit 1
+      "tailscale-activate",
+      `const cmd = process.argv[2];
+if (cmd === "status") {
+  console.log('{"BackendState":"Running","Self":{"DNSName":"activate-mac.tail999.ts.net.","CapMap":{"https":[]}}}');
+  process.exit(0);
+}
+if (cmd === "funnel") {
+  console.log("Funnel is not enabled on your tailnet.");
+  console.log("To enable, visit https://login.tailscale.com/f/funnel?node=n123");
+  await new Promise((r) => setTimeout(r, 100));
+  console.log("https://activate-mac.tail999.ts.net/");
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else {
+  process.exit(1);
+}
 `,
     );
 
@@ -155,13 +157,12 @@ exit 1
 
   test("startTailscaleFunnel fails clearly when Tailscale is stopped", async () => {
     const fakeTailscale = makeTempScript(
-      "tailscale-stopped.sh",
-      `#!/usr/bin/env bash
-if [ "$1" = "status" ]; then
-  echo '{"BackendState":"Stopped"}'
-  exit 0
-fi
-exit 1
+      "tailscale-stopped",
+      `if (process.argv[2] === "status") {
+  console.log('{"BackendState":"Stopped"}');
+  process.exit(0);
+}
+process.exit(1);
 `,
     );
 
@@ -172,17 +173,19 @@ exit 1
 
   test("startTailscaleFunnel aborts in-flight startup promptly when AbortSignal fires", async () => {
     const fakeTailscale = makeTempScript(
-      "tailscale-hang.sh",
-      `#!/usr/bin/env bash
-if [ "$1" = "status" ]; then
-  echo '{"BackendState":"Running","Self":{"DNSName":"hang-mac.tail999.ts.net.","CapMap":{"https":[]}}}'
-  exit 0
-fi
-if [ "$1" = "funnel" ]; then
-  trap 'exit 0' INT TERM
-  while true; do sleep 1; done
-fi
-exit 1
+      "tailscale-hang",
+      `const cmd = process.argv[2];
+if (cmd === "status") {
+  console.log('{"BackendState":"Running","Self":{"DNSName":"hang-mac.tail999.ts.net.","CapMap":{"https":[]}}}');
+  process.exit(0);
+}
+if (cmd === "funnel") {
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else {
+  process.exit(1);
+}
 `,
     );
 

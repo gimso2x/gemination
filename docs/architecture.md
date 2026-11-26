@@ -30,7 +30,12 @@ Local Owner Browser / Chrome `--app` Window
 Bun Listener 2 — Loopback-Only Studio UI Server (127.0.0.1:3848, src/dashboard.ts + src/ui/*)
    ├─ Direct loopback only (`isDirectLocalRequest` checks Host, proxy headers, `Sec-Fetch-Site`)
    ├─ Zero CORS headers; POST mutations gated by `X-Gemination-Local-Token` CSRF token + Origin check
-   └─ Controls TunnelController, OAuth PIN/Revoke, Workspace Roots + Finder picker, Secret-Shielded File/Git Explorer, Chrome Login Launcher (src/browser-launcher.ts)
+   └─ Controls TunnelController, Local MCP Clients (`src/mcp-clients.ts`), Context Pack (`/_local/context-pack`), OAuth PIN/Revoke, Workspace Roots + native folder picker, Secret-Shielded File/Git Explorer, Chrome Login Launcher (`src/browser-launcher.ts`)
+
+Local MCP Clients (Gemini CLI / Claude Desktop / Cursor — zero region lock / zero tunnel)
+   ▼ JSON-RPC over stdin/stdout (`bun run src/cli.ts stdio`)
+StdioServerTransport (`src/cli.ts`)
+   └─ Shares identical `createGeminationMcpServer` (`src/tools.ts`, Path Jail, Secret Shield, ProcessManager, AuditLogger)
 ```
 
 ## 2. Gemini Web Compatibility Design
@@ -55,15 +60,16 @@ Bun Listener 2 — Loopback-Only Studio UI Server (127.0.0.1:3848, src/dashboard
 ## 3. Supporting Runtime Components
 
 - **Dual-Port Isolation (`src/http-server.ts`, `src/dashboard.ts`)**: Studio UI and `/_local/*` endpoints bind on a separate loopback port (`port + 1`, default `3848`) that is never targeted by tunnels or reverse proxies. Listener 1 (`port`, default `3847`) returns `404` for `/` and `/_local/*`, and omits wildcard CORS on `/healthz`, `/oauth/register`, `/oauth/authorize`, and `/oauth/revoke`.
-- **Dedicated Browser Launcher (`src/browser-launcher.ts`)**: Opens Gemini Web in an isolated Chromium profile under `<configDir>/browser-profile` so Google Web sessions stay persistent without storing passwords or cookies inside Gemination state.
-- **Process, Lock & Power Lifecycle (`src/lock.ts`, `src/power.ts`, `src/service.ts`)**: Atomic instance locking prevents duplicate daemons on the same config dir; `KeepAwakeController` toggles macOS `caffeinate`; LaunchAgent helpers manage optional background auto-start.
+- **Cross-Platform Abstraction (`src/platform.ts`)**: Encapsulates OS-specific shell selection (`powershell.exe`/`cmd.exe` vs `zsh`/`sh`), graceful termination (`taskkill /T` vs `SIGTERM`/`SIGKILL`), clipboard helpers (`pbcopy`, `clip.exe`, `wl-copy`/`xclip`/`xsel`), git null hooks (`NUL` vs `/dev/null`), and localized UI metadata across macOS, Windows, and Linux.
+- **Dedicated Browser Launcher (`src/browser-launcher.ts`)**: Opens Gemini Web in an isolated Chromium profile under `<configDir>/browser-profile` (discovering Chrome/Edge/Brave on macOS, Windows, and Linux) so Google Web sessions stay persistent without storing passwords or cookies inside Gemination state.
+- **Process, Lock & Power Lifecycle (`src/lock.ts`, `src/power.ts`, `src/service.ts`)**: Atomic instance locking prevents duplicate daemons on the same config dir; `KeepAwakeController` supports macOS `caffeinate`, Windows `SetThreadExecutionState`, and Linux `systemd-inhibit`; `service.ts` manages optional login auto-start via macOS LaunchAgent, Linux `systemd --user`, and Windows Startup VBS launchers.
 - **UI Architecture**: See [docs/design.md](design.md) for the Studio UI tokens, typography, and responsive layout contract.
 
 ## 4. Security Controls
 
 - **Zero plaintext secrets on disk**: PINs use per-state random salt + `scrypt` (`timingSafeEqual` verification); access tokens, refresh tokens, auth codes, and static client secrets are hashed with SHA-256 before persistence/lookup.
 - **One-time PIN & global brute-force protection**: After approval, the generated session PIN rotates automatically (unless `GEMINATION_PIN` env is explicitly pinned). Failed PIN attempts on `POST /oauth/authorize` trigger a global rate limit of 5 attempts per 5 minutes (HTTP `429`), independent of proxy headers.
-- **Workspace jail & dangling-symlink protection**: `resolveSafePath` inspects path components and symlink chains via `lstatSync` + `readlinkSync` + `realpathSync`, enforcing workspace roots and blocking `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.npmrc`, `~/.netrc`, `~/.git-credentials`, `~/.config/{gh,gcloud,gemination}`, `~/Library/Keychains`, Chrome user data, `/etc/shadow`, and `/etc/sudoers`.
-- **Argument & git-hook hardening**: `search_files` binds ripgrep flags with `-e`, `--glob=`, and `--`; `git_inspect` and Studio Git views pass safe `git -c` overrides and disable external diffs/textconv; `.git/config` and `.git/hooks` writes are blocked under `--no-shell`.
+- **Workspace jail & dangling-symlink protection**: `resolveSafePath` inspects path components and symlink chains via `lstatSync` + `readlinkSync` + `realpathSync`, enforcing workspace roots (with case-insensitive comparisons on Windows) and blocking `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.npmrc`, `~/.netrc`, `~/.git-credentials`, `~/.config/{gh,gcloud,gemination}`, macOS Keychains, Linux keyrings, Windows `System32\config`/`%APPDATA%\gemination`, Chromium/Chrome/Edge user data dirs, `/etc/shadow`, and `/etc/sudoers`.
+- **Argument & git-hook hardening**: `search_files` binds ripgrep flags with `-e`, `--glob=`, and `--`; `git_inspect` and Studio Git views pass safe `git -c` overrides (`NUL` / `/dev/null` hooksPath) and disable external diffs/textconv; `.git/config` and `.git/hooks` writes (POSIX and Windows separators) are blocked under `--no-shell`.
 - **Secret Shield & Audit Log**: `src/secrets-shield.ts` redacts provider keys, JWTs, PEM keys, `gma_`/`gmr_`/`gsec_`, `Bearer` tokens, credentialed URLs, and secret settings in both MCP tool outputs, local previews, error messages, and `audit.jsonl`.
-- **Command guardrails**: `checkCommandSafety` blocks catastrophic destructive shell patterns as an accidental-damage guardrail (not an OS container sandbox); use `--read-only` / `--no-shell` when working on untrusted repositories.
+- **Command guardrails**: `checkCommandSafety` blocks catastrophic destructive shell patterns (POSIX + PowerShell/`cmd.exe`) as an accidental-damage guardrail (not an OS container sandbox); use `--read-only` / `--no-shell` when working on untrusted repositories.

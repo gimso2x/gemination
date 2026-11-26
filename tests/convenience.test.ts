@@ -15,9 +15,14 @@ import { ProcessManager } from "../src/process-manager.ts";
 import { AuditLogger } from "../src/security.ts";
 import { TunnelController } from "../src/tunnel-controller.ts";
 import {
+  getBackgroundServiceStatus,
   getLaunchAgentStatus,
+  installBackgroundService,
   installLaunchAgent,
   renderLaunchAgentPlist,
+  renderSystemdUserUnit,
+  renderWindowsStartupVbs,
+  uninstallBackgroundService,
   uninstallLaunchAgent,
 } from "../src/service.ts";
 import { probePublicEndpoint } from "../src/tunnel.ts";
@@ -122,6 +127,94 @@ describe("Profile config resolution, lockfile, and LaunchAgent helpers", () => {
     });
     expect(un.removed).toBe(true);
     expect(un.status.installed).toBe(false);
+  });
+
+  test("Cross-platform background service render, install, status, and uninstall work for systemd & Windows Startup", () => {
+    const cfgDir = makeTempDir("gemination-xsvc-cfg-");
+    const unitDir = makeTempDir("gemination-xsvc-unit-");
+    const startupDir = makeTempDir("gemination-xsvc-win-");
+
+    const unit = renderSystemdUserUnit({
+      projectRoot: process.cwd(),
+      configDir: cfgDir,
+      port: 3847,
+      tunnelMode: "tailscale",
+      profile: "linux-prof",
+      bunPath: "/usr/local/bin/bun",
+      serviceDir: unitDir,
+      platform: "linux",
+      skipServiceControl: true,
+    });
+    expect(unit).toContain("ExecStart=");
+    expect(unit).toContain("GEMINATION_SERVICE_MODE=1");
+    expect(unit).toContain('"--tunnel" "tailscale"');
+
+    const vbs = renderWindowsStartupVbs({
+      projectRoot: process.cwd(),
+      configDir: cfgDir,
+      port: 3847,
+      tunnelMode: "tailscale",
+      profile: "win-prof",
+      bunPath: "C:\\Users\\demo\\.bun\\bin\\bun.exe",
+      serviceDir: startupDir,
+      platform: "win32",
+      skipServiceControl: true,
+    });
+    expect(vbs).toContain("WScript.Shell");
+    expect(vbs).toContain('env("GEMINATION_SERVICE_MODE") = "1"');
+    expect(vbs).toContain("--no-prompt");
+
+    const linInstall = installBackgroundService({
+      projectRoot: process.cwd(),
+      configDir: cfgDir,
+      port: 3847,
+      tunnelMode: "none",
+      profile: "linux-prof",
+      serviceDir: unitDir,
+      platform: "linux",
+      skipServiceControl: true,
+    });
+    expect(linInstall.kind).toBe("systemd");
+    expect(linInstall.installed).toBe(true);
+    expect(existsSync(linInstall.servicePath)).toBe(true);
+    const linStatus = getBackgroundServiceStatus({
+      configDir: cfgDir,
+      profile: "linux-prof",
+      serviceDir: unitDir,
+      platform: "linux",
+      skipServiceControl: true,
+    });
+    expect(linStatus.installed).toBe(true);
+    const linUn = uninstallBackgroundService({
+      configDir: cfgDir,
+      profile: "linux-prof",
+      serviceDir: unitDir,
+      platform: "linux",
+      skipServiceControl: true,
+    });
+    expect(linUn.removed).toBe(true);
+
+    const winInstall = installBackgroundService({
+      projectRoot: process.cwd(),
+      configDir: cfgDir,
+      port: 3847,
+      tunnelMode: "none",
+      profile: "win-prof",
+      serviceDir: startupDir,
+      platform: "win32",
+      skipServiceControl: true,
+    });
+    expect(winInstall.kind).toBe("windows-startup");
+    expect(winInstall.installed).toBe(true);
+    expect(existsSync(winInstall.servicePath)).toBe(true);
+    const winUn = uninstallBackgroundService({
+      configDir: cfgDir,
+      profile: "win-prof",
+      serviceDir: startupDir,
+      platform: "win32",
+      skipServiceControl: true,
+    });
+    expect(winUn.removed).toBe(true);
   });
 
   test("probePublicEndpoint verifies valid RFC 9728 metadata and flags errors", async () => {
@@ -291,8 +384,10 @@ describe("Local-only management dashboard & control endpoints", () => {
       expect(previewJson.content).toContain("[OpenAI key hidden]");
       expect(previewJson.content).not.toContain("sk-proj-");
 
+      const outsideFile = join(makeTempDir("gemination-outside-"), "outside.txt");
+      writeFileSync(outsideFile, "outside\n", "utf8");
       const traversalRes = await fetch(
-        `${studioBase}/_local/file-content?root=${encodeURIComponent(ws1)}&path=/etc/passwd`,
+        `${studioBase}/_local/file-content?root=${encodeURIComponent(ws1)}&path=${encodeURIComponent(outsideFile)}`,
       );
       expect(traversalRes.status).toBe(403);
 
@@ -326,7 +421,7 @@ describe("Local-only management dashboard & control endpoints", () => {
       }
 
       // 3d. Process manager stop endpoint
-      const procInfo = pm.start("sleep 5", ws1);
+      const procInfo = pm.start('bun -e "setInterval(() => {}, 1000)"', ws1);
       const stopProcRes = await fetch(`${studioBase}/_local/processes/stop`, {
         method: "POST",
         headers: {

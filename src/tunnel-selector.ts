@@ -1,10 +1,13 @@
+import { getTunnelInstallHint } from "./platform.ts";
 import {
+  canAutoInstallPackages,
   formatPermissionPresetLabel,
+  isNativeFolderPickerAvailable,
   LinePrompt,
   promptWorkspaceAndPermissions,
-  tryBrewInstall,
+  tryAutoInstallTool,
 } from "./setup-wizard.ts";
-import { inspectTailscaleStatus, type TailscaleStatusInfo } from "./tunnel.ts";
+import { findCloudflaredBinary, inspectTailscaleStatus, type TailscaleStatusInfo } from "./tunnel.ts";
 import type { GeminationConfig, TailscaleFunnelPort } from "./types.ts";
 
 export type TunnelSelectionResult =
@@ -79,7 +82,7 @@ export function formatTunnelMenu(options: {
   hideSettingsOption?: boolean;
 }): string {
   const { config, tailscale, cloudflaredBinary, defaultChoice, hideSettingsOption } = options;
-  const cfStatus = cloudflaredBinary ? "준비됨" : "미설치 (brew install cloudflared)";
+  const cfStatus = cloudflaredBinary ? "준비됨" : `미설치 (${getTunnelInstallHint("cloudflared")})`;
   const savedCustom = config.publicUrl ? ` · 저장됨: ${config.publicUrl}` : "";
 
   return [
@@ -105,7 +108,7 @@ export function formatTunnelMenu(options: {
     `  [4] 로컬 전용 (127.0.0.1 · 외부 터널 없음 / 테스트용)${defaultChoice === "4" ? "  [기본값]" : ""}`,
     "      - Gemini Web(gemini.google.com)에서는 로컬 127.0.0.1에 직접 접근할 수 없습니다.",
     "",
-    ...(hideSettingsOption ? [] : ["  [s] 작업 폴더 / 보안 권한 설정 변경 (Finder 폴더 선택 · 안전모드 전환)"]),
+    ...(hideSettingsOption ? [] : ["  [s] 작업 폴더 / 보안 권한 설정 변경 (폴더 선택 · 안전모드 전환)"]),
     "  [q] 취소",
     "============================================================",
     "",
@@ -130,9 +133,10 @@ export async function promptTunnelSelection(
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
   const httpsPort: TailscaleFunnelPort = options.funnelPort ?? options.config.tailscaleFunnelPort ?? 443;
-  const allowBrew = Boolean(
-    options.allowBrewInstall ?? (process.platform === "darwin" && Boolean((input as { isTTY?: boolean }).isTTY) && Boolean(Bun.which("brew"))),
+  const allowAutoInstall = Boolean(
+    options.allowBrewInstall ?? (Boolean((input as { isTTY?: boolean }).isTTY) && canAutoInstallPackages()),
   );
+  const pkgMgrLabel = process.platform === "darwin" ? "Homebrew" : "winget";
 
   let workingConfig = options.config;
   let configModified = false;
@@ -177,7 +181,7 @@ export async function promptTunnelSelection(
 
       if (!options.hideSettingsOption && (choice === "s" || choice === "setup")) {
         const res = await promptWorkspaceAndPermissions(prompter, workingConfig, output, {
-          allowMacOsFinder: Boolean((input as { isTTY?: boolean }).isTTY),
+          allowNativePicker: Boolean((input as { isTTY?: boolean }).isTTY) && isNativeFolderPickerAvailable(),
         });
         if (res.cancelled) return { cancelled: true };
         workingConfig = res.config;
@@ -190,14 +194,14 @@ export async function promptTunnelSelection(
         if (!tailscaleStatus.installed) {
           output.write(
             "\n[안내] Tailscale이 설치되어 있지 않습니다.\n"
-            + "  1) `brew install --cask tailscale` 또는 App Store에서 Tailscale 설치\n"
-            + "  2) Tailscale 앱 실행 및 로그인 후 [1]을 다시 선택하세요.\n"
+            + `  1) \`${getTunnelInstallHint("tailscale")}\` 또는 공식 앱 설치\n`
+            + "  2) Tailscale 실행 및 로그인 후 [1]을 다시 선택하세요.\n"
             + "  (바로 테스트하려면 [2] Cloudflare Quick Tunnel을 선택할 수 있습니다.)\n\n",
           );
-          if (allowBrew) {
-            const installAns = await prompter.ask("Homebrew로 Tailscale을 지금 설치할까요? [y/N]: ");
+          if (allowAutoInstall) {
+            const installAns = await prompter.ask(`${pkgMgrLabel}로 Tailscale을 지금 설치할까요? [y/N]: `);
             if (installAns?.trim().toLowerCase() === "y") {
-              if (tryBrewInstall("tailscale")) {
+              if (tryAutoInstallTool("tailscale")) {
                 tailscaleStatus = inspectTailscaleStatus(httpsPort);
                 output.write("[완료] Tailscale 설치됨. Tailscale 앱을 실행해 로그인한 뒤 [1]을 선택하세요.\n\n");
               }
@@ -231,13 +235,13 @@ export async function promptTunnelSelection(
         if (!cfBinary) {
           output.write(
             "\n[안내] cloudflared가 설치되어 있지 않습니다.\n"
-            + "  설치 명령: `brew install cloudflared`\n\n",
+            + `  설치 명령: \`${getTunnelInstallHint("cloudflared")}\`\n\n`,
           );
-          if (allowBrew) {
-            const installAns = await prompter.ask("Homebrew로 cloudflared를 지금 설치할까요? [y/N]: ");
+          if (allowAutoInstall) {
+            const installAns = await prompter.ask(`${pkgMgrLabel}로 cloudflared를 지금 설치할까요? [y/N]: `);
             if (installAns?.trim().toLowerCase() === "y") {
-              if (tryBrewInstall("cloudflared")) {
-                cfBinary = Bun.which("cloudflared");
+              if (tryAutoInstallTool("cloudflared")) {
+                cfBinary = findCloudflaredBinary();
                 if (cfBinary) {
                   return {
                     cancelled: false,

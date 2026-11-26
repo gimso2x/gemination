@@ -13,6 +13,31 @@ const MACOS_CHROME_CANDIDATES = [
   "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ];
 
+function getWindowsBrowserCandidates(env: NodeJS.ProcessEnv): string[] {
+  const pf = env.ProgramFiles?.trim() || env.PROGRAMFILES?.trim() || "C:\\Program Files";
+  const pf86 = env["ProgramFiles(x86)"]?.trim() || env["PROGRAMFILES(X86)"]?.trim() || "C:\\Program Files (x86)";
+  const localAppData = env.LOCALAPPDATA?.trim() || "";
+  return [
+    join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+    join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+    ...(localAppData ? [join(localAppData, "Google", "Chrome", "Application", "chrome.exe")] : []),
+    join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+    join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+    join(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+    ...(localAppData ? [join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")] : []),
+  ];
+}
+
+const LINUX_CHROME_CANDIDATES = [
+  "/usr/bin/google-chrome",
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  "/snap/bin/chromium",
+  "/usr/bin/brave-browser",
+  "/usr/bin/microsoft-edge",
+];
+
 export interface BrowserProfileStatus {
   profileDir: string;
   initialized: boolean;
@@ -20,7 +45,10 @@ export interface BrowserProfileStatus {
   chromeAvailable: boolean;
 }
 
-export function findChromeBinary(env: NodeJS.ProcessEnv = process.env): string | null {
+export function findChromeBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): string | null {
   const override = env.GEMINATION_CHROME_BIN?.trim();
   if (override) {
     if (existsSync(override)) return override;
@@ -28,8 +56,32 @@ export function findChromeBinary(env: NodeJS.ProcessEnv = process.env): string |
     if (fromPath) return fromPath;
   }
 
-  if (process.platform === "darwin") {
+  if (platform === "darwin") {
     for (const candidate of MACOS_CHROME_CANDIDATES) {
+      if (existsSync(candidate)) return candidate;
+    }
+  } else if (platform === "win32") {
+    for (const candidate of getWindowsBrowserCandidates(env)) {
+      if (existsSync(candidate)) return candidate;
+    }
+    for (const binName of ["chrome", "msedge", "brave", "chromium"]) {
+      const resolved = Bun.which(binName);
+      if (resolved) return resolved;
+    }
+    return null;
+  } else {
+    for (const binName of [
+      "google-chrome",
+      "google-chrome-stable",
+      "chromium",
+      "chromium-browser",
+      "brave-browser",
+      "microsoft-edge",
+    ]) {
+      const resolved = Bun.which(binName);
+      if (resolved) return resolved;
+    }
+    for (const candidate of LINUX_CHROME_CANDIDATES) {
       if (existsSync(candidate)) return candidate;
     }
   }
@@ -180,20 +232,52 @@ export function resetDedicatedBrowserProfile(configDir: string): boolean {
   return true;
 }
 
-export function openTailscaleMacApp(): boolean {
-  if (isHeadlessOrDisabled() || process.platform !== "darwin") {
+export function openTailscaleApp(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): boolean {
+  if (isHeadlessOrDisabled()) {
     return false;
   }
+
   try {
-    const proc = Bun.spawn(["open", "-a", "Tailscale"], {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      detached: true,
-    });
-    proc.unref();
-    return true;
+    if (platform === "darwin") {
+      const proc = Bun.spawn(["open", "-a", "Tailscale"], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        detached: true,
+      });
+      proc.unref();
+      return true;
+    }
+
+    if (platform === "win32") {
+      const pf = env.ProgramFiles?.trim() || env.PROGRAMFILES?.trim() || "C:\\Program Files";
+      const candidates = [
+        Bun.which("tailscale-ipn.exe"),
+        Bun.which("tailscale-ipn"),
+        join(pf, "Tailscale", "tailscale-ipn.exe"),
+      ];
+      for (const candidate of candidates) {
+        if (candidate && existsSync(candidate)) {
+          const proc = Bun.spawn([candidate], {
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+            detached: true,
+          });
+          proc.unref();
+          return true;
+        }
+      }
+      return openInBrowser("https://tailscale.com/download/windows");
+    }
+
+    return openInBrowser("https://login.tailscale.com/admin/machines");
   } catch {
     return false;
   }
 }
+
+export const openTailscaleMacApp = openTailscaleApp;

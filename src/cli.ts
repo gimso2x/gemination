@@ -4,6 +4,7 @@ import { createServer as createNetServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { GEMINI_WEB_URL, openDesktopAppWindow } from "./browser-launcher.ts";
 import {
   DEFAULT_PORT,
@@ -16,25 +17,35 @@ import {
 } from "./config.ts";
 import { startGeminationHttpServer } from "./http-server.ts";
 import { acquireInstanceLock, readInstanceLock } from "./lock.ts";
+import {
+  detectLocalClients,
+  isLocalMcpClientId,
+  registerLocalClient,
+  unregisterLocalClient,
+} from "./mcp-clients.ts";
 import { OAuthServer } from "./oauth.ts";
 import { createKeepAwakeController } from "./power.ts";
 import { ProcessManager } from "./process-manager.ts";
 import { attachRuntimeHotkeys } from "./runtime-keys.ts";
+import { getPlatformUiMeta, getTunnelInstallHint, tryCopyToClipboard } from "./platform.ts";
 import { AuditLogger } from "./security.ts";
 import {
-  getLaunchAgentStatus,
-  installLaunchAgent,
+  getBackgroundServiceStatus,
+  installBackgroundService,
   readServiceLogTail,
-  uninstallLaunchAgent,
+  uninstallBackgroundService,
 } from "./service.ts";
 import {
   formatPermissionPresetLabel,
+  isNativeFolderPickerAvailable,
   LinePrompt,
   openInBrowser,
   promptWorkspaceAndPermissions,
 } from "./setup-wizard.ts";
+import { createGeminationMcpServer } from "./tools.ts";
 import { TunnelController } from "./tunnel-controller.ts";
 import {
+  findCloudflaredBinary,
   findTailscaleBinary,
   inspectTailscaleStatus,
   type PublicProbeResult,
@@ -161,6 +172,8 @@ function parseCliArgs(argv: string[]): ParsedArgs {
       parsed.rotatePin = true;
     } else if (token === "--rotate-static-client") {
       parsed.rotateStaticClient = true;
+    } else if (token === "--remove") {
+      parsed.subArgs.push("--remove");
     } else if (token === "--no-copy") {
       parsed.noCopy = true;
     } else if (!token.startsWith("-")) {
@@ -187,14 +200,16 @@ Usage:
 Commands:
   gui           Launch Gemination Studio desktop/web GUI (workbench + Chrome login + tunnel control)
   up            One-click start: interactive tunnel/workspace picker, auto-init, probe, dashboard & copy URL
+  stdio         Run MCP server over stdio (zero region lock / zero tunnel — for Gemini CLI, Claude, Cursor)
+  connect       Register/remove Gemination stdio MCP in local clients (gemini-cli | claude-desktop | cursor | remove | snippet)
   setup         Interactive setup wizard for workspace roots, safety mode, and default tunnel
   serve         Start the local MCP + OAuth server + loopback Studio UI
   config        Inspect or modify saved settings (get | add-root | remove-root | read-only | shell | secret-shield | keep-awake | tunnel)
-  service       Manage macOS background auto-start LaunchAgent (install | uninstall | status)
+  service       Manage OS background auto-start service (LaunchAgent / systemd --user / Startup VBS)
   init          Initialize config, workspace roots, owner approval code, and static OAuth client
   credentials   Show summary and optionally rotate owner PIN or static OAuth client credentials
   revoke        Revoke all active OAuth access and refresh tokens
-  doctor        Check Bun, tailscale, cloudflared, caffeinate, rg, git, lock, config, roots, and port
+  doctor        Check Bun, tailscale, cloudflared, keep-awake, rg, git, lock, config, roots, and port
 
 Options:
   --root <dir>                  Allow workspace root (repeatable)
@@ -211,7 +226,7 @@ Options:
   --no-shell                    Disable run_command / start_process tools
   --read-only                   Disable write_file / edit_file tools
   --no-secret-shield            Disable automatic masking of API keys/tokens in MCP tool output
-  --no-caffeinate               Disable macOS sleep prevention while serving
+  --no-caffeinate               Disable sleep prevention while serving (macOS/Windows/Linux)
   --no-probe                    Skip external HTTPS self-check probe after tunnel startup
   --open-dashboard              Open Studio UI in default browser when ready
   --reset-pin                   Generate and print a new owner approval PIN on serve/up/setup/gui
@@ -304,16 +319,6 @@ function pickDefaultRoot(): string {
   return process.cwd();
 }
 
-function tryCopyToClipboard(text: string): boolean {
-  if (process.platform !== "darwin") return false;
-  try {
-    const res = Bun.spawnSync(["pbcopy"], { stdin: Buffer.from(text, "utf8") });
-    return res.exitCode === 0;
-  } catch {
-    return false;
-  }
-}
-
 type ResolvedTunnelPlan =
   | { mode: "tailscale"; httpsPort: TailscaleFunnelPort }
   | { mode: "quick" }
@@ -345,7 +350,7 @@ async function runSetup(parsed: ParsedArgs): Promise<void> {
   const prompter = new LinePrompt(process.stdin, process.stdout);
   try {
     const wiz = await promptWorkspaceAndPermissions(prompter, config, process.stdout, {
-      allowMacOsFinder: process.platform === "darwin" && Boolean(process.stdin.isTTY),
+      allowNativePicker: Boolean(process.stdin.isTTY) && isNativeFolderPickerAvailable(),
     });
     if (wiz.cancelled) {
       console.log("설정을 취소했습니다.");
@@ -355,7 +360,7 @@ async function runSetup(parsed: ParsedArgs): Promise<void> {
 
     const funnelPort = parsed.funnelPort ?? config.tailscaleFunnelPort ?? 443;
     const tailscale = inspectTailscaleStatus(funnelPort);
-    const cloudflaredBinary = process.env.CLOUDFLARED_BIN?.trim() || Bun.which("cloudflared");
+    const cloudflaredBinary = findCloudflaredBinary();
     const selection = await promptTunnelSelection({
       config,
       tailscale,
@@ -405,7 +410,8 @@ async function runSetup(parsed: ParsedArgs): Promise<void> {
   if (pin) {
     console.log(` Approval PIN: ${pin}`);
   }
-  console.log(" 이제 `./start.sh` 또는 `bun run up` 으로 바로 실행할 수 있습니다.");
+  const runHint = process.platform === "win32" ? "Start-Gemination.bat` 또는 `bun run up" : "./start.sh` 또는 `bun run up";
+  console.log(` 이제 \`${runHint}\` 으로 바로 실행할 수 있습니다.`);
   console.log("============================================================");
 }
 
@@ -539,7 +545,7 @@ function runServiceCommand(parsed: ParsedArgs): void {
     }
     new OAuthServer(configDir, config);
 
-    const status = installLaunchAgent({
+    const status = installBackgroundService({
       projectRoot,
       configDir,
       port: config.port,
@@ -547,38 +553,47 @@ function runServiceCommand(parsed: ParsedArgs): void {
       publicUrl: config.publicUrl,
       profile: parsed.profile,
     });
-    console.log("macOS 백그라운드 서비스(LaunchAgent) 등록 완료.");
+    const serviceLabel =
+      status.kind === "launchagent"
+        ? "macOS LaunchAgent"
+        : status.kind === "systemd"
+          ? "Linux systemd user service"
+          : status.kind === "windows-startup"
+            ? "Windows Startup launcher"
+            : "백그라운드 서비스";
+    console.log(`${serviceLabel} 등록 완료.`);
     console.log(`  Label:      ${status.label}`);
-    console.log(`  Plist:      ${status.plistPath}`);
-    console.log(`  Loaded:     ${status.loaded}`);
+    console.log(`  Service:    ${status.servicePath}`);
+    console.log(`  Active:     ${status.loaded}`);
     console.log(`  Stdout Log: ${status.stdoutLogPath}`);
     console.log(`  Stderr Log: ${status.stderrLogPath}`);
     return;
   }
 
   if (action === "uninstall") {
-    const { removed, status } = uninstallLaunchAgent({
+    const { removed, status } = uninstallBackgroundService({
       configDir,
       profile: parsed.profile,
     });
     console.log(
       removed
-        ? `백그라운드 서비스 제거 완료 (${status.plistPath})`
-        : `등록된 서비스 파일이 없습니다 (${status.plistPath})`,
+        ? `백그라운드 서비스 제거 완료 (${status.servicePath})`
+        : `등록된 서비스 파일이 없습니다 (${status.servicePath})`,
     );
     return;
   }
 
   if (action === "status") {
-    const status = getLaunchAgentStatus({
+    const status = getBackgroundServiceStatus({
       configDir,
       profile: parsed.profile,
     });
     const lockInfo = readInstanceLock(configDir);
-    console.log(`Supported (macOS): ${status.supported}`);
+    console.log(`Platform / Type:   ${process.platform} (${status.kind})`);
+    console.log(`Supported:         ${status.supported}`);
     console.log(`Label:             ${status.label}`);
-    console.log(`Installed:         ${status.installed} (${status.plistPath})`);
-    console.log(`Launchd Loaded:    ${status.loaded}`);
+    console.log(`Installed:         ${status.installed} (${status.servicePath})`);
+    console.log(`Active / Loaded:   ${status.loaded}`);
     console.log(
       `Running Instance:  ${lockInfo.running ? `PID ${lockInfo.record?.pid} · ${lockInfo.record?.localBaseUrl ?? ""}` : "not running"}`,
     );
@@ -641,7 +656,7 @@ async function runServe(parsed: ParsedArgs, options: { copyMcpUrl?: boolean } = 
     if (shouldPrompt) {
       const funnelPort = parsed.funnelPort ?? effectiveConfig.tailscaleFunnelPort ?? 443;
       const tailscale = inspectTailscaleStatus(funnelPort);
-      const cloudflaredBinary = process.env.CLOUDFLARED_BIN?.trim() || Bun.which("cloudflared");
+      const cloudflaredBinary = findCloudflaredBinary();
       const selection = await promptTunnelSelection({
         config: effectiveConfig,
         tailscale,
@@ -842,7 +857,7 @@ async function runServe(parsed: ParsedArgs, options: { copyMcpUrl?: boolean } = 
   }
   console.log(` Allowed Roots:       ${runtimeConfig.roots.join(", ")}`);
   console.log(` Permissions:         ${formatPermissionPresetLabel(runtimeConfig)}`);
-  console.log(` Keep Awake:          ${keepAwake.isActive() ? "ON (caffeinate 활성)" : "OFF"}`);
+  console.log(` Keep Awake:          ${keepAwake.isActive() ? `ON (${keepAwake.getBackend()} 활성)` : "OFF"}`);
   const activePin = serverHandle.getLatestPin();
   if (!isServiceMode) {
     if (activePin) {
@@ -873,6 +888,7 @@ async function runServe(parsed: ParsedArgs, options: { copyMcpUrl?: boolean } = 
   console.log(`   2. MCP Server URL 입력: ${mcpUrl}`);
   console.log("   3. Client ID / Secret 은 비워두고 Next -> Connect 클릭");
   console.log("   4. 열리는 승인 페이지에 위 Local Owner Approval Code 입력 후 Approve 클릭");
+  console.log("   * 참고: 한국 리전 등 웹 맞춤 앱 미지원 시 -> bun run connect gemini-cli (터널 불필요)");
   console.log("============================================================");
   if (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY)) {
     console.log(" 단축키: [c] URL 복사 | [p] 새 PIN 발급 | [d] Studio UI 열기 | [g] Gemini 열기 | [r] 토큰 즉시 폐기 | [q/Ctrl+C] 종료");
@@ -952,6 +968,8 @@ async function runDoctor(parsed: ParsedArgs): Promise<void> {
   const config = loadConfig(configDir);
   const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
 
+  const uiMeta = getPlatformUiMeta();
+  checks.push({ name: "platform", ok: true, detail: `${uiMeta.platform} (${process.arch}) — ${uiMeta.serviceTitle}` });
   checks.push({ name: "bun", ok: true, detail: Bun.version });
   const tailscaleBinary = findTailscaleBinary();
   const tsStatus = inspectTailscaleStatus(
@@ -963,18 +981,37 @@ async function runDoctor(parsed: ParsedArgs): Promise<void> {
     ok: tsStatus.running && Boolean(tsStatus.dnsName),
     detail: tsStatus.binary ? `${tsStatus.detail} (${tsStatus.binary})` : tsStatus.detail,
   });
-  const cloudflared = process.env.CLOUDFLARED_BIN?.trim() || Bun.which("cloudflared");
+  const cloudflared = findCloudflaredBinary();
   checks.push({
     name: "cloudflared",
     ok: Boolean(cloudflared),
-    detail: cloudflared ?? "missing (optional — only needed for Cloudflare Quick Tunnel; `brew install cloudflared`)",
+    detail: cloudflared ?? `missing (optional — only needed for Cloudflare Quick Tunnel; ${getTunnelInstallHint("cloudflared")})`,
   });
   if (process.platform === "darwin") {
     const caffeinate = Bun.which("caffeinate");
     checks.push({
-      name: "caffeinate",
+      name: "keep-awake (caffeinate)",
       ok: Boolean(caffeinate),
       detail: caffeinate ?? "not found",
+    });
+  } else if (process.platform === "linux") {
+    const inhibit = Bun.which("systemd-inhibit");
+    checks.push({
+      name: "keep-awake (systemd-inhibit)",
+      ok: true,
+      detail: inhibit ?? "not found (optional — sleep inhibition disabled when absent)",
+    });
+  } else if (process.platform === "win32") {
+    const ps =
+      Bun.which("powershell.exe")
+      || Bun.which("pwsh.exe")
+      || (existsSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+        ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        : null);
+    checks.push({
+      name: "keep-awake (SetThreadExecutionState)",
+      ok: Boolean(ps),
+      detail: ps ?? "PowerShell not found on PATH",
     });
   }
   const rg = Bun.which("rg");
@@ -1217,6 +1254,137 @@ async function runGui(parsed: ParsedArgs): Promise<void> {
   }
 }
 
+async function runStdio(parsed: ParsedArgs): Promise<void> {
+  // CRITICAL: stdout is exclusively reserved for MCP JSON-RPC frames. Never call console.log here.
+  const configDir = resolveConfigDir({ configDir: parsed.configDir, profile: parsed.profile });
+  const hasConfig = existsSync(getConfigPath(configDir));
+  const baseConfig = loadConfig(configDir);
+  const config = applyOverrides(baseConfig, parsed);
+  if (!hasConfig && parsed.roots.length === 0) {
+    config.roots = normalizeRoots([pickDefaultRoot()]);
+  }
+
+  const audit = new AuditLogger(configDir);
+  const processManager = new ProcessManager();
+  const mcpServer = createGeminationMcpServer({
+    config,
+    configDir,
+    defaultCwd: config.roots[0] ?? process.cwd(),
+    audit,
+    processManager,
+  });
+  const transport = new StdioServerTransport();
+
+  let cleanedUp = false;
+  const cleanup = async (exitAfter = false): Promise<void> => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    processManager.stopAll();
+    try {
+      await mcpServer.close();
+    } catch {
+      // Ignore close errors during shutdown.
+    }
+    if (exitAfter) {
+      process.exit(0);
+    }
+  };
+
+  process.on("SIGINT", () => void cleanup(true));
+  process.on("SIGTERM", () => void cleanup(true));
+  process.stdin.on("end", () => void cleanup(false));
+
+  await mcpServer.connect(transport);
+}
+
+function runConnectCommand(parsed: ParsedArgs): void {
+  const configDir = resolveConfigDir({ configDir: parsed.configDir, profile: parsed.profile });
+  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const arg0 = parsed.subArgs[0];
+  const arg1 = parsed.subArgs[1];
+
+  if (arg0 === "snippet") {
+    const { snippetJson } = detectLocalClients(projectRoot, configDir);
+    process.stdout.write(snippetJson);
+    return;
+  }
+
+  if (!arg0 || arg0 === "status") {
+    const { clients, snippetJson } = detectLocalClients(projectRoot, configDir);
+    console.log("============================================================");
+    console.log(" Gemination 로컬 MCP 클라이언트 연동 (터널 · 웹 맞춤 앱 불필요)");
+    console.log("============================================================");
+    console.log(" * gemini.google.com '맞춤 앱'은 현재 미국/영어 계정 제한이 있어");
+    console.log("   한국 리전에서는 아래 로컬 클라이언트(stdio MCP) 연동을 권장합니다.");
+    console.log("");
+    for (const c of clients) {
+      const regText = c.registered ? (c.upToDate ? "등록됨 (최신)" : "등록됨 (경로 갱신 권장)") : "미등록";
+      const cliNote =
+        c.id === "gemini-cli"
+          ? ` | CLI: ${c.cliInstalled ? c.cliBinary : `미설치 (${c.installCommand})`}`
+          : "";
+      console.log(` - ${c.id.padEnd(14)} ${regText}${cliNote}`);
+      console.log(`   설정 파일: ${c.configPath}`);
+    }
+    console.log("");
+    console.log("등록 예시:");
+    console.log("  bun run connect gemini-cli       # 한국 리전 Google 계정 로그인 Gemini CLI");
+    console.log("  bun run connect claude-desktop   # Claude Desktop");
+    console.log("  bun run connect cursor           # Cursor IDE");
+    console.log("");
+    console.log("기타 MCP 클라이언트(VS Code / Antigravity 등)용 JSON:");
+    console.log(snippetJson.trimEnd());
+    return;
+  }
+
+  if (arg0 === "remove" || parsed.subArgs.includes("--remove")) {
+    const target = arg0 === "remove" ? arg1 : arg0;
+    if (!isLocalMcpClientId(target)) {
+      throw new Error(`지원하지 않는 클라이언트입니다: ${target ?? "(none)"} (gemini-cli | claude-desktop | cursor)`);
+    }
+    const res = unregisterLocalClient(target);
+    console.log(
+      res.removed
+        ? `Gemination 등록을 해제했습니다: ${res.configPath}`
+        : `등록된 Gemination 항목이 없습니다: ${res.configPath}`,
+    );
+    return;
+  }
+
+  if (!isLocalMcpClientId(arg0)) {
+    throw new Error(
+      `알 수 없는 connect 대상 "${arg0}". status, snippet, gemini-cli, claude-desktop, cursor, remove 중 하나를 사용하세요.`,
+    );
+  }
+
+  if (!existsSync(getConfigPath(configDir))) {
+    const cfg = applyOverrides(loadConfig(configDir), parsed);
+    if (parsed.roots.length === 0) {
+      cfg.roots = normalizeRoots([pickDefaultRoot()]);
+    }
+    saveConfig(cfg, configDir);
+  }
+
+  const res = registerLocalClient(arg0, projectRoot, configDir);
+  console.log(`[완료] ${arg0}에 Gemination stdio MCP를 등록했습니다.`);
+  console.log(`  설정 파일: ${res.configPath}`);
+  if (res.backupPath) {
+    console.log(`  기존 백업: ${res.backupPath}`);
+  }
+  console.log(`  Perm Roots: ${loadConfig(configDir).roots.join(", ")}`);
+  if (arg0 === "gemini-cli") {
+    console.log("");
+    console.log("다음 단계:");
+    if (!Bun.which("gemini")) {
+      console.log("  1. Gemini CLI 설치: npm install -g @google/gemini-cli");
+      console.log("  2. 터미널에서 `gemini` 실행 후 개인 Google 계정으로 로그인");
+    } else {
+      console.log("  1. 터미널에서 `gemini` 실행 후 개인 Google 계정으로 로그인");
+    }
+    console.log("  3. Gemini CLI 안에서 `/mcp` 입력해 `gemination` 도구 12종 연결 확인");
+  }
+}
+
 async function main(): Promise<void> {
   const parsed = parseCliArgs(process.argv.slice(2));
   if (parsed.help || parsed.command === "help") {
@@ -1230,6 +1398,12 @@ async function main(): Promise<void> {
       break;
     case "up":
       await runServe(parsed, { copyMcpUrl: true });
+      break;
+    case "stdio":
+      await runStdio(parsed);
+      break;
+    case "connect":
+      runConnectCommand(parsed);
       break;
     case "setup":
       await runSetup(parsed);

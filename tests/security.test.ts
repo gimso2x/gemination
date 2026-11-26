@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { getConfigDir } from "../src/config.ts";
-import { AuditLogger, checkCommandSafety, resolveSafePath, SecurityError } from "../src/security.ts";
+import { AuditLogger, checkCommandSafety, isPathInside, resolveSafePath, SecurityError } from "../src/security.ts";
 
 let workspaceDir: string;
 let outsideDir: string;
@@ -40,7 +40,7 @@ describe("resolveSafePath", () => {
 
   test("blocks .. traversal outside root", () => {
     expect(() =>
-      resolveSafePath(`../${outsideDir.split("/").pop()}/secret.txt`, [workspaceDir], workspaceDir, {
+      resolveSafePath(`../${basename(outsideDir)}/secret.txt`, [workspaceDir], workspaceDir, {
         configDir,
       }),
     ).toThrow(SecurityError);
@@ -118,6 +118,25 @@ describe("checkCommandSafety", () => {
     expect(() => checkCommandSafety(":(){ :|:& };:")).toThrow(SecurityError);
     expect(() => checkCommandSafety("dd if=/dev/zero of=/dev/disk0")).toThrow(SecurityError);
     expect(() => checkCommandSafety("shutdown -h now")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("Remove-Item -Recurse -Force C:\\")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("rd /s /q C:\\Windows")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("rd /q /s C:\\Windows")).toThrow(SecurityError);
+    expect(() => checkCommandSafety('Remove-Item "C:\\"`\n-Recurse -Force')).toThrow(SecurityError);
+    expect(() => checkCommandSafety("Stop-Computer -Force")).toThrow(SecurityError);
+  });
+
+  test("isPathInside handles Windows case-insensitive paths, macOS case-insensitive denied checks, and separator boundaries", () => {
+    expect(isPathInside("c:\\users\\alice\\Project\\sub\\file.ts", "C:\\Users\\Alice\\project", "win32")).toBe(true);
+    expect(isPathInside("C:\\Users\\Alice\\project-other\\file.ts", "C:\\Users\\Alice\\project", "win32")).toBe(false);
+    expect(isPathInside("/Users/alice/project", "/Users/alice/project", "darwin")).toBe(true);
+    expect(isPathInside("/Users/alice/project-other", "/Users/alice/project", "darwin")).toBe(false);
+
+    if (process.platform === "darwin" || process.platform === "win32") {
+      const home = homedir();
+      expect(() =>
+        resolveSafePath(join(home, ".NPMRC"), [home], home, { allowMissingLeaf: true, configDir }),
+      ).toThrow(SecurityError);
+    }
   });
 });
 

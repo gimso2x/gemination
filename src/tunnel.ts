@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { getTunnelInstallHint, killProcessGracefully } from "./platform.ts";
 import type { TailscaleFunnelPort } from "./types.ts";
 
 export interface TunnelHandle {
@@ -74,11 +76,10 @@ export async function startCloudflaredQuickTunnel(
     throw new Error("Tunnel startup aborted");
   }
 
-  const envBin = process.env.CLOUDFLARED_BIN?.trim();
-  const binary = envBin || Bun.which("cloudflared");
+  const binary = findCloudflaredBinary();
   if (!binary) {
     throw new Error(
-      "cloudflared binary not found in PATH. Install it via `brew install cloudflared` or choose Tailscale Funnel / `--tunnel none --public-url <url>`.",
+      `cloudflared 실행 파일을 찾을 수 없습니다. \`${getTunnelInstallHint("cloudflared")}\`로 설치하거나 Tailscale Funnel / \`--tunnel none --public-url <url>\`을 선택하세요.`,
     );
   }
 
@@ -92,17 +93,9 @@ export async function startCloudflaredQuickTunnel(
   let settled = false;
 
   const stop = async (): Promise<void> => {
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Already exited.
-    }
+    killProcessGracefully(proc, false);
     const deadline = setTimeout(() => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // Ignore.
-      }
+      killProcessGracefully(proc, true);
     }, 2000);
     try {
       await proc.exited;
@@ -170,7 +163,51 @@ export async function startCloudflaredQuickTunnel(
   });
 }
 
-export function findTailscaleBinary(env: NodeJS.ProcessEnv = process.env): string | null {
+export function findCloudflaredBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): string | null {
+  const override = env.CLOUDFLARED_BIN?.trim();
+  if (override) {
+    if (existsSync(override)) return override;
+    const resolved = Bun.which(override);
+    if (resolved) return resolved;
+  }
+
+  const fromPath = Bun.which("cloudflared");
+  if (fromPath) return fromPath;
+
+  if (platform === "win32") {
+    const pf = env.ProgramFiles?.trim() || env.PROGRAMFILES?.trim() || "C:\\Program Files";
+    const pf86 = env["ProgramFiles(x86)"]?.trim() || env["PROGRAMFILES(X86)"]?.trim() || "C:\\Program Files (x86)";
+    const localAppData = env.LOCALAPPDATA?.trim() || "";
+    for (const candidate of [
+      join(pf, "cloudflared", "cloudflared.exe"),
+      join(pf86, "cloudflared", "cloudflared.exe"),
+      ...(localAppData ? [join(localAppData, "Microsoft", "WinGet", "Links", "cloudflared.exe")] : []),
+    ]) {
+      if (existsSync(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  if (platform === "darwin") {
+    for (const candidate of ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"]) {
+      if (existsSync(candidate)) return candidate;
+    }
+  } else {
+    for (const candidate of ["/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+
+  return null;
+}
+
+export function findTailscaleBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): string | null {
   const override = env.TAILSCALE_BIN?.trim();
   if (override) {
     if (existsSync(override)) return override;
@@ -181,8 +218,23 @@ export function findTailscaleBinary(env: NodeJS.ProcessEnv = process.env): strin
   const fromPath = Bun.which("tailscale");
   if (fromPath) return fromPath;
 
-  if (process.platform === "darwin" && existsSync(MACOS_TAILSCALE_APP_BIN)) {
+  if (platform === "darwin" && existsSync(MACOS_TAILSCALE_APP_BIN)) {
     return MACOS_TAILSCALE_APP_BIN;
+  }
+
+  if (platform === "win32") {
+    const pf = env.ProgramFiles?.trim() || env.PROGRAMFILES?.trim() || "C:\\Program Files";
+    const pf86 = env["ProgramFiles(x86)"]?.trim() || env["PROGRAMFILES(X86)"]?.trim() || "C:\\Program Files (x86)";
+    for (const candidate of [
+      join(pf, "Tailscale", "tailscale.exe"),
+      join(pf86, "Tailscale", "tailscale.exe"),
+    ]) {
+      if (existsSync(candidate)) return candidate;
+    }
+  } else if (platform === "linux") {
+    for (const candidate of ["/usr/bin/tailscale", "/usr/local/bin/tailscale"]) {
+      if (existsSync(candidate)) return candidate;
+    }
   }
 
   return null;
@@ -316,7 +368,7 @@ export function inspectTailscaleStatus(
       running: false,
       httpsEnabled: false,
       funnelCapabilityDetected: false,
-      detail: "미설치 (brew install --cask tailscale)",
+      detail: `미설치 (${getTunnelInstallHint("tailscale")})`,
     };
   }
 
@@ -347,7 +399,7 @@ export async function inspectTailscaleStatusAsync(
       running: false,
       httpsEnabled: false,
       funnelCapabilityDetected: false,
-      detail: "미설치 (brew install --cask tailscale)",
+      detail: `미설치 (${getTunnelInstallHint("tailscale")})`,
     };
   }
 
@@ -415,7 +467,7 @@ export async function startTailscaleFunnel(
   const binary = options.binary ?? findTailscaleBinary();
   if (!binary) {
     throw new Error(
-      "Tailscale CLI를 찾을 수 없습니다. `brew install --cask tailscale`로 설치하고 로그인한 뒤 다시 실행하세요.",
+      `Tailscale CLI를 찾을 수 없습니다. \`${getTunnelInstallHint("tailscale")}\`로 설치하고 로그인한 뒤 다시 실행하세요.`,
     );
   }
 
@@ -445,24 +497,20 @@ export async function startTailscaleFunnel(
   let notifiedEnableUrl = false;
 
   const stop = async (): Promise<void> => {
-    try {
-      proc.kill("SIGINT");
-    } catch {
-      // Already exited.
+    if (process.platform === "win32") {
+      killProcessGracefully(proc, false);
+    } else {
+      try {
+        proc.kill("SIGINT");
+      } catch {
+        // Already exited.
+      }
     }
     const termTimer = setTimeout(() => {
-      try {
-        proc.kill("SIGTERM");
-      } catch {
-        // Ignore.
-      }
+      killProcessGracefully(proc, false);
     }, 2500);
     const killTimer = setTimeout(() => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // Ignore.
-      }
+      killProcessGracefully(proc, true);
     }, 4000);
     try {
       await proc.exited;

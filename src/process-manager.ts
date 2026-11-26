@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { buildSanitizedChildEnv, resolvePosixShell } from "./security.ts";
+import { killProcessGracefully, resolveShellCommand } from "./platform.ts";
+import { buildSanitizedChildEnv } from "./security.ts";
 import type { ManagedProcessInfo } from "./types.ts";
 
 const MAX_CONCURRENT_PROCESSES = 16;
@@ -145,8 +146,7 @@ export class ProcessManager {
   start(command: string, cwd: string): ManagedProcessInfo {
     this.pruneFinishedIfFull();
     const id = `proc_${randomBytes(6).toString("hex")}`;
-    const shell = resolvePosixShell();
-    const proc = Bun.spawn([shell, "-lc", command], {
+    const proc = Bun.spawn(resolveShellCommand(command), {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
@@ -216,11 +216,7 @@ export class ProcessManager {
       const sig = force ? "SIGKILL" : "SIGTERM";
       entry.signal = sig;
       entry.status = "killed";
-      try {
-        entry.proc.kill(sig);
-      } catch {
-        // Process may already have exited.
-      }
+      killProcessGracefully(entry.proc, force);
       entry.endedAt = new Date().toISOString();
     }
     return this.toInfo(entry);
@@ -233,14 +229,10 @@ export class ProcessManager {
   stopAll(): void {
     for (const entry of this.entries.values()) {
       if (entry.status === "running") {
-        try {
-          entry.proc.kill("SIGTERM");
-          entry.status = "killed";
-          entry.signal = "SIGTERM";
-          entry.endedAt = new Date().toISOString();
-        } catch {
-          // Ignore already exited processes.
-        }
+        killProcessGracefully(entry.proc, true);
+        entry.status = "killed";
+        entry.signal = "SIGTERM";
+        entry.endedAt = new Date().toISOString();
       }
     }
   }

@@ -9,7 +9,7 @@ import {
   type Stats,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, win32 } from "node:path";
 import { ensureDirSecure, expandTilde } from "./config.ts";
 import { maskSecrets } from "./secrets-shield.ts";
 import type { AuditEntry } from "./types.ts";
@@ -61,15 +61,28 @@ function tryLstat(target: string): Stats | null {
   }
 }
 
-export function isPathInside(candidate: string, parent: string): boolean {
-  const normCandidate = resolve(candidate);
-  const normParent = resolve(parent);
+export function isPathInside(
+  candidate: string,
+  parent: string,
+  targetPlatform: string = process.platform,
+  caseInsensitive: boolean = targetPlatform === "win32",
+): boolean {
+  const pathImpl = targetPlatform === "win32" ? win32 : { resolve, sep: "/" };
+  let normCandidate = pathImpl.resolve(candidate);
+  let normParent = pathImpl.resolve(parent);
+  if (caseInsensitive) {
+    normCandidate = normCandidate.toLowerCase();
+    normParent = normParent.toLowerCase();
+  }
   if (normCandidate === normParent) return true;
-  const prefix = normParent.endsWith(sep) ? normParent : `${normParent}${sep}`;
+  const prefix = normParent.endsWith(pathImpl.sep) ? normParent : `${normParent}${pathImpl.sep}`;
   return normCandidate.startsWith(prefix);
 }
 
-export function getSensitiveDeniedPaths(configDir: string): string[] {
+export function getSensitiveDeniedPaths(
+  configDir: string,
+  targetPlatform: string = process.platform,
+): string[] {
   const home = homedir();
   const candidates = [
     join(home, ".ssh"),
@@ -83,12 +96,36 @@ export function getSensitiveDeniedPaths(configDir: string): string[] {
     join(home, ".npmrc"),
     join(home, ".netrc"),
     join(home, ".git-credentials"),
-    join(home, "Library", "Keychains"),
-    join(home, "Library", "Application Support", "Google", "Chrome"),
     configDir,
-    "/etc/shadow",
-    "/etc/sudoers",
   ];
+
+  if (targetPlatform === "darwin") {
+    candidates.push(
+      join(home, "Library", "Keychains"),
+      join(home, "Library", "Application Support", "Google", "Chrome"),
+      "/etc/shadow",
+      "/etc/sudoers",
+    );
+  } else if (targetPlatform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA?.trim() || join(home, "AppData", "Local");
+    const appData = process.env.APPDATA?.trim() || join(home, "AppData", "Roaming");
+    candidates.push(
+      join(localAppData, "Google", "Chrome", "User Data"),
+      join(localAppData, "Microsoft", "Edge", "User Data"),
+      join(localAppData, "BraveSoftware", "Brave-Browser", "User Data"),
+      join(appData, "gemination"),
+      "C:\\Windows\\System32\\config",
+    );
+  } else {
+    candidates.push(
+      join(home, ".config", "google-chrome"),
+      join(home, ".config", "chromium"),
+      join(home, ".local", "share", "keyrings"),
+      "/etc/shadow",
+      "/etc/sudoers",
+    );
+  }
+
   return [...new Set(candidates.map(canonicalizeIfPossible))];
 }
 
@@ -190,8 +227,9 @@ export function resolveSafePath(
 
   const configDir = options.configDir ?? join(homedir(), ".config", "gemination");
   const deniedPaths = getSensitiveDeniedPaths(configDir);
+  const caseInsensitiveDenied = process.platform === "win32" || process.platform === "darwin";
   for (const denied of deniedPaths) {
-    if (isPathInside(canonicalTarget, denied)) {
+    if (isPathInside(canonicalTarget, denied, process.platform, caseInsensitiveDenied)) {
       throw new SecurityError(`Access denied: "${inputPath}" points to a protected path (${denied})`);
     }
   }
@@ -228,6 +266,22 @@ const CATASTROPHIC_COMMAND_PATTERNS: Array<{ pattern: RegExp; reason: string }> 
     pattern: /(^|[;&|\s])diskutil\s+(eraseDisk|eraseVolume|partitionDisk|zeroDisk)\b/i,
     reason: "Destructive diskutil partition/erase commands are blocked",
   },
+  {
+    pattern: /(^|[;&|\s])(?:Remove-Item|ri|del|rd)\b[^\n]*(?:-Recurse\b[^\n]*-Force\b|-Force\b[^\n]*-Recurse\b)[^\n]*(\s+["']?[a-zA-Z]:[/\\](\*|\s|["']|$)|["']?~[/\\]?["']?(\s|$)|\$HOME\b|\$env:USERPROFILE\b)/i,
+    reason: "Destructive PowerShell recursive delete targeting root or user profile is blocked",
+  },
+  {
+    pattern: /(^|[;&|\s])(?:Remove-Item|ri)\b[^\n]*(\s+["']?[a-zA-Z]:[/\\](\*|\s|["'])|\$env:USERPROFILE\b)[^\n]*(?:-Recurse\b[^\n]*-Force\b|-Force\b[^\n]*-Recurse\b)/i,
+    reason: "Destructive PowerShell recursive delete targeting root or user profile is blocked",
+  },
+  {
+    pattern: /(^|[;&|\s])(rd|rmdir)\s+[^\n]*(?:\/s\b[^\n]*\/q\b|\/q\b[^\n]*\/s\b)[^\n]*(\s+["']?[a-zA-Z]:[/\\](Windows\b|[/\\]|\s|["']|$)|%(USERPROFILE|SystemRoot|WINDIR)%)/i,
+    reason: "Destructive cmd rd /s /q targeting drive root or system directory is blocked",
+  },
+  {
+    pattern: /(^|[;&|\s])(format\s+[a-zA-Z]:|diskpart\b|Stop-Computer\b|Restart-Computer\b)/i,
+    reason: "Destructive Windows disk or power command is blocked",
+  },
 ];
 
 export function checkCommandSafety(command: string): void {
@@ -238,7 +292,7 @@ export function checkCommandSafety(command: string): void {
   if (trimmed.includes("\0")) {
     throw new SecurityError("Command contains NUL byte");
   }
-  const flattened = trimmed.replace(/\\\r?\n/g, " ");
+  const flattened = trimmed.replace(/[\\`]\r?\n/g, " ");
   for (const rule of CATASTROPHIC_COMMAND_PATTERNS) {
     if (rule.pattern.test(trimmed) || rule.pattern.test(flattened)) {
       throw new SecurityError(`Blocked dangerous command: ${rule.reason}`);

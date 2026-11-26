@@ -8,17 +8,21 @@ import {
   writeFileSync,
 } from "node:fs";
 import { arch, hostname, platform, release } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import { version as PKG_VERSION } from "../package.json";
 import {
+  getGitNullHooksPath,
+  killProcessGracefully,
+  resolveShellCommand,
+} from "./platform.ts";
+import {
   buildSanitizedChildEnv,
   checkCommandSafety,
   getSensitiveDeniedPaths,
   isPathInside,
-  resolvePosixShell,
   resolveSafePath,
   SecurityError,
 } from "./security.ts";
@@ -30,18 +34,44 @@ export const SAFE_GIT_ARGS = [
   "-c",
   "core.fsmonitor=false",
   "-c",
-  "core.hooksPath=/dev/null",
+  `core.hooksPath=${getGitNullHooksPath()}`,
   "-c",
   "diff.external=",
   "-c",
   "core.pager=cat",
 ] as const;
 
+const CASE_INSENSITIVE_FS = process.platform === "win32" || process.platform === "darwin";
+
+function isDeniedPath(candidate: string, deniedPaths: string[]): boolean {
+  return deniedPaths.some((denied) => isPathInside(candidate, denied, process.platform, CASE_INSENSITIVE_FS));
+}
+
+function normalizeGitSegment(seg: string): string {
+  // Strip Win32 NTFS ADS suffixes (`:stream:$DATA`) and trailing dots/spaces.
+  return seg.replace(/:.*$/, "").replace(/[. ]+$/, "").toLowerCase();
+}
+
 export function isProtectedGitMetadataPath(absPath: string): boolean {
-  const parts = absPath.split(sep).filter(Boolean).map((p) => p.toLowerCase());
-  for (let i = 0; i < parts.length - 1; i += 1) {
-    if (parts[i] === ".git" && (parts[i + 1] === "config" || parts[i + 1] === "hooks")) {
+  const rawParts = absPath.split(/[/\\]+/).filter(Boolean);
+  const parts = rawParts.map(normalizeGitSegment);
+  for (let i = 0; i < parts.length; i += 1) {
+    if (parts[i] !== ".git") continue;
+    // Block NTFS ADS syntax anywhere under .git
+    for (let j = i + 1; j < rawParts.length; j += 1) {
+      if (rawParts[j]!.includes(":")) return true;
+    }
+    const next = parts[i + 1];
+    if (next === "config" || next?.startsWith("config.") || next === "hooks") {
       return true;
+    }
+    if (next === "modules") {
+      for (let j = i + 2; j < parts.length; j += 1) {
+        const sub = parts[j];
+        if (sub === "config" || sub?.startsWith("config.") || sub === "hooks") {
+          return true;
+        }
+      }
     }
   }
   return false;
@@ -158,7 +188,7 @@ async function runSimpleShell(
   durationMs: number;
 }> {
   const started = Date.now();
-  const proc = Bun.spawn([resolvePosixShell(), "-lc", command], {
+  const proc = Bun.spawn(resolveShellCommand(command), {
     cwd,
     stdout: "pipe",
     stderr: "pipe",
@@ -169,18 +199,10 @@ async function runSimpleShell(
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const timer = setTimeout(() => {
     timedOut = true;
-    try {
-      proc.kill("SIGTERM");
-      killTimer = setTimeout(() => {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // Already exited.
-        }
-      }, 1500);
-    } catch {
-      // Already exited.
-    }
+    killProcessGracefully(proc, false);
+    killTimer = setTimeout(() => {
+      killProcessGracefully(proc, true);
+    }, 1500);
   }, timeoutMs);
 
   try {
@@ -214,16 +236,12 @@ async function runArgv(
     cwd,
     stdout: "pipe",
     stderr: "pipe",
-    env: process.env,
+    env: { ...buildSanitizedChildEnv(), GIT_TERMINAL_PROMPT: "0" },
   });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Ignore.
-    }
+    killProcessGracefully(proc, false);
   }, timeoutMs);
   try {
     const [stdoutRes, stderrRes, exitCode] = await Promise.all([
@@ -271,7 +289,7 @@ function fallbackSearch(
 
   function walk(dir: string): void {
     if (results.length >= maxResults) return;
-    if (deniedPaths.some((denied) => isPathInside(dir, denied))) return;
+    if (isDeniedPath(dir, deniedPaths)) return;
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -282,14 +300,15 @@ function fallbackSearch(
       if (results.length >= maxResults) return;
       if (entry.name === ".git" || entry.name === "node_modules") continue;
       const full = join(dir, entry.name);
-      if (deniedPaths.some((denied) => isPathInside(full, denied))) continue;
+      if (isDeniedPath(full, deniedPaths)) continue;
       const rel = relative(rootDir, full) || entry.name;
+      const relPosix = rel.replaceAll("\\", "/");
       if (entry.isDirectory()) {
         walk(full);
         continue;
       }
       if (!entry.isFile()) continue;
-      if (globRegex && !globRegex.test(rel)) continue;
+      if (globRegex && !globRegex.test(relPosix)) continue;
 
       if (mode === "files") {
         if (contentRegex.test(rel)) {
@@ -431,7 +450,7 @@ export function createGeminationMcpServer(ctx: ToolContext): McpServer {
             truncated = true;
             return;
           }
-          if (deniedPaths.some((denied) => isPathInside(current, denied))) {
+          if (isDeniedPath(current, deniedPaths)) {
             return;
           }
           const entries = readdirSync(current, { withFileTypes: true }).sort((a, b) =>
@@ -445,7 +464,7 @@ export function createGeminationMcpServer(ctx: ToolContext): McpServer {
               return;
             }
             const full = join(current, entry.name);
-            if (deniedPaths.some((denied) => isPathInside(full, denied))) continue;
+            if (isDeniedPath(full, deniedPaths)) continue;
             const rel = relative(targetDir, full) || entry.name;
             const kind = entry.isDirectory() ? "directory" : entry.isSymbolicLink() ? "symlink" : "file";
             let size: number | undefined;
@@ -637,8 +656,7 @@ export function createGeminationMcpServer(ctx: ToolContext): McpServer {
           configDir: ctx.configDir,
         });
         const deniedPaths = getSensitiveDeniedPaths(ctx.configDir);
-        const isAllowedPath = (candidate: string): boolean =>
-          !deniedPaths.some((denied) => isPathInside(candidate, denied));
+        const isAllowedPath = (candidate: string): boolean => !isDeniedPath(candidate, deniedPaths);
 
         const rgBin = Bun.which("rg");
         if (rgBin) {

@@ -1,6 +1,6 @@
 {
   "name": "gemination",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Gemini Web -> Local PC official MCP connector with Studio GUI (Streamable HTTP + OAuth 2.1 + Tailscale Funnel / Cloudflare Tunnel)",
@@ -32,6 +32,8 @@
   "scripts": {
     "gui": "bun run src/cli.ts gui",
     "up": "bun run src/cli.ts up",
+    "stdio": "bun run src/cli.ts stdio",
+    "connect": "bun run src/cli.ts connect",
     "setup": "bun run src/cli.ts setup",
     "start": "bun run src/cli.ts serve",
     "start:tailscale": "bun run src/cli.ts serve --tunnel tailscale",

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { killProcessGracefully } from "../src/platform.ts";
+import { makeMockCli } from "./helpers/mock-cli.ts";
 
 const tempDirs: string[] = [];
 
@@ -12,11 +14,21 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
-function makeTempScript(dir: string, filename: string, content: string): string {
-  const scriptPath = join(dir, filename);
-  writeFileSync(scriptPath, content, "utf8");
-  chmodSync(scriptPath, 0o755);
-  return scriptPath;
+async function stopCliProcess(proc: Bun.Subprocess): Promise<number> {
+  if (process.platform === "win32") {
+    killProcessGracefully(proc, true, "win32");
+  } else {
+    proc.kill("SIGTERM");
+  }
+  return await proc.exited;
+}
+
+function expectCleanStopExitCode(code: number): void {
+  if (process.platform === "win32") {
+    expect(typeof code).toBe("number");
+  } else {
+    expect(code).toBe(0);
+  }
 }
 
 async function runChooseCli(options: {
@@ -92,10 +104,12 @@ async function runChooseCli(options: {
     reader.releaseLock();
   }
 
+  let exitCode: number;
   if (options.waitForText && sawMarker) {
-    proc.kill("SIGTERM");
+    exitCode = await stopCliProcess(proc);
+  } else {
+    exitCode = await proc.exited;
   }
-  const exitCode = await proc.exited;
   await readStderr;
   return { stdout, stderr, exitCode };
 }
@@ -146,30 +160,31 @@ describe("gemination CLI up onboarding & convenience flows", () => {
       expect(existsSync(join(cfgDir, "state.json"))).toBe(true);
     } finally {
       reader.releaseLock();
-      proc.kill("SIGTERM");
-      const code = await proc.exited;
-      expect(code).toBe(0);
+      const code = await stopCliProcess(proc);
+      expectCleanStopExitCode(code);
     }
   });
 
   test("interactive --choose menu allows picking Tailscale Funnel (choice 1) with mock Tailscale CLI", async () => {
     const cfgDir = makeTempDir("gemination-choose-ts-");
     const binDir = makeTempDir("gemination-ts-bin-");
-    const fakeTailscale = makeTempScript(
+    const fakeTailscale = makeMockCli(
       binDir,
       "tailscale",
-      `#!/usr/bin/env bash
-if [ "$1" = "status" ]; then
-  echo '{"BackendState":"Running","Self":{"DNSName":"test-box.tail999.ts.net.","CapMap":{"https":[]}}}'
-  exit 0
-fi
-if [ "$1" = "funnel" ]; then
-  echo "Available on the internet:"
-  echo "https://test-box.tail999.ts.net/"
-  trap 'exit 0' INT TERM
-  while true; do sleep 1; done
-fi
-exit 1
+      `const cmd = process.argv[2];
+if (cmd === "status") {
+  console.log('{"BackendState":"Running","Self":{"DNSName":"test-box.tail999.ts.net.","CapMap":{"https":[]}}}');
+  process.exit(0);
+}
+if (cmd === "funnel") {
+  console.log("Available on the internet:");
+  console.log("https://test-box.tail999.ts.net/");
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else {
+  process.exit(1);
+}
 `,
     );
 
@@ -180,7 +195,7 @@ exit 1
       waitForText: "Press Ctrl+C to stop.",
     });
 
-    expect(res.exitCode).toBe(0);
+    expectCleanStopExitCode(res.exitCode);
     expect(res.stdout).toContain("Tailscale Funnel");
     expect(res.stdout).toContain("재시작할 때마다 gemini.google.com 커넥터를 다시 등록해야 합니다.");
     expect(res.stdout).toContain("Gemini MCP URL:      https://test-box.tail999.ts.net/mcp");
@@ -193,14 +208,14 @@ exit 1
   test("interactive --choose menu allows picking Quick Tunnel (choice 2), prints restart warning & auto-PIN even when state exists", async () => {
     const cfgDir = makeTempDir("gemination-choose-cf-");
     const binDir = makeTempDir("gemination-cf-bin-");
-    const fakeCloudflared = makeTempScript(
+    const fakeCloudflared = makeMockCli(
       binDir,
       "cloudflared",
-      `#!/usr/bin/env bash
-echo "INF +--------------------------------------------------------------------------------------------+" >&2
-echo "INF |  https://mock-quick-tunnel-demo.trycloudflare.com                                          |" >&2
-trap 'exit 0' INT TERM
-while true; do sleep 1; done
+      `console.error("INF +--------------------------------------------------------------------------------------------+");
+console.error("INF |  https://mock-quick-tunnel-demo.trycloudflare.com                                          |");
+process.on("SIGINT", () => process.exit(0));
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
 `,
     );
 
@@ -218,7 +233,7 @@ while true; do sleep 1; done
       waitForText: "Press Ctrl+C to stop.",
     });
 
-    expect(res.exitCode).toBe(0);
+    expectCleanStopExitCode(res.exitCode);
     expect(res.stdout).toContain("Gemini MCP URL:      https://mock-quick-tunnel-demo.trycloudflare.com/mcp");
     expect(res.stdout).toContain("[!] Quick Tunnel 안내 (중요):");
     expect(res.stdout).toContain("재시작할 때마다 gemini.google.com 커넥터 URL을 다시 등록해야 합니다.");
@@ -237,7 +252,7 @@ while true; do sleep 1; done
       waitForText: "Press Ctrl+C to stop.",
     });
 
-    expect(res.exitCode).toBe(0);
+    expectCleanStopExitCode(res.exitCode);
     expect(res.stdout).toContain("읽기 전용 (안전 모드)");
     const saved = JSON.parse(readFileSync(join(cfgDir, "config.json"), "utf8")) as {
       allowWrite: boolean;
@@ -341,10 +356,9 @@ while true; do sleep 1; done
       expect(out).not.toContain(`http://127.0.0.1:${heldPort}/mcp`);
     } finally {
       reader.releaseLock();
-      proc.kill("SIGTERM");
-      const code = await proc.exited;
+      const code = await stopCliProcess(proc);
       await new Promise<void>((r) => holder.close(() => r()));
-      expect(code).toBe(0);
+      expectCleanStopExitCode(code);
     }
   });
 
@@ -400,9 +414,8 @@ while true; do sleep 1; done
       expect(existsSync(join(cfgDir, "state.json"))).toBe(true);
     } finally {
       reader.releaseLock();
-      proc.kill("SIGTERM");
-      const code = await proc.exited;
-      expect(code).toBe(0);
+      const code = await stopCliProcess(proc);
+      expectCleanStopExitCode(code);
     }
   });
 
@@ -458,9 +471,8 @@ while true; do sleep 1; done
       expect(out).toMatch(/Gemini MCP URL:\s+http:\/\/127\.0\.0\.1:\d+\/mcp/);
     } finally {
       reader.releaseLock();
-      proc.kill("SIGTERM");
-      const code = await proc.exited;
-      expect(code).toBe(0);
+      const code = await stopCliProcess(proc);
+      expectCleanStopExitCode(code);
     }
   });
 });

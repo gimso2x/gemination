@@ -27,6 +27,8 @@
   let lastRecentAuditKey = "";
   let lastFullAuditKey = "";
   let lastAuditFilterKey = "";
+  let lastLocalClientsKey = "";
+  let lastSnippetJson = "";
 
   const shellEl = document.getElementById("appShell");
   const sidebarEl = document.getElementById("sidebar");
@@ -218,10 +220,11 @@
 
   function formatRootOptionLabel(rootPath) {
     if (!rootPath || rootPath.length <= 32) return rootPath;
-    const parts = rootPath.split("/").filter(Boolean);
+    const sep = rootPath.includes("\\") ? "\\" : "/";
+    const parts = rootPath.split(/[/\\]+/).filter(Boolean);
     if (parts.length <= 2) return rootPath;
-    const tail = parts.slice(-2).join("/");
-    return tail.length <= 28 ? `.../${tail}` : parts[parts.length - 1];
+    const tail = parts.slice(-2).join(sep);
+    return tail.length <= 28 ? `...${sep}${tail}` : parts[parts.length - 1];
   }
 
   function formatTunnelLabel(mode) {
@@ -306,7 +309,7 @@
         use.setAttribute("href", "#i-folder");
         svg.append(use);
         const span = document.createElement("span");
-        span.textContent = root.split("/").filter(Boolean).pop() || root;
+        span.textContent = root.split(/[/\\]+/).filter(Boolean).pop() || root;
         btn.append(svg, span);
         btn.onclick = () => {
           explorerRoot = root;
@@ -350,10 +353,24 @@
     navProc.textContent = String(procCount);
 
     // Readiness Strip
-    document.getElementById("readyTunnelText").textContent =
-      tState.state === "connected" && tState.mode !== "none" ? `${modeLabel} 연결됨` : modeLabel;
-    document.getElementById("readyTunnelSub").textContent =
-      data.probeStatus && data.probeStatus.detail ? data.probeStatus.detail : data.publicBaseUrl;
+    const lcClients = Array.isArray(data.localClients?.clients) ? data.localClients.clients : [];
+    const registeredLocalClients = lcClients.filter((c) => c.registered);
+    const hasLocalClient = registeredLocalClients.length > 0;
+    const isExternallyConnected = tState.state === "connected" && tState.mode !== "none";
+
+    if (isExternallyConnected) {
+      document.getElementById("readyTunnelText").textContent = `${modeLabel} 연결됨`;
+      document.getElementById("readyTunnelSub").textContent =
+        data.probeStatus && data.probeStatus.detail ? data.probeStatus.detail : data.publicBaseUrl;
+    } else if (hasLocalClient) {
+      document.getElementById("readyTunnelText").textContent = "로컬 MCP 연동됨 (한국 OK)";
+      document.getElementById("readyTunnelSub").textContent =
+        `${registeredLocalClients.map((c) => c.id).join(", ")} · 터널 불필요`;
+    } else {
+      document.getElementById("readyTunnelText").textContent = modeLabel;
+      document.getElementById("readyTunnelSub").textContent =
+        data.probeStatus && data.probeStatus.detail ? data.probeStatus.detail : data.publicBaseUrl;
+    }
 
     const bp = data.browserProfile || {};
     document.getElementById("readyBrowserText").textContent = bp.initialized
@@ -367,10 +384,16 @@
 
     const activeTokens = Number(data.oauthSummary?.activeTokenCount || 0);
     document.getElementById("readyOAuthText").textContent =
-      activeTokens > 0 ? `연결됨 (토큰 ${activeTokens}개)` : "아직 미연결";
+      activeTokens > 0
+        ? `연결됨 (토큰 ${activeTokens}개)`
+        : hasLocalClient
+          ? `로컬 stdio ${registeredLocalClients.length}개 활성`
+          : "아직 미연결";
     document.getElementById("readyOAuthSub").textContent = data.latestPin
       ? `PIN: ${data.latestPin}`
-      : "필요 시 새 PIN 발급";
+      : hasLocalClient
+        ? "웹 맞춤 앱 없이 사용 가능"
+        : "필요 시 새 PIN 발급";
 
     // Probe badge
     const probeBadge = document.getElementById("probeBadge");
@@ -393,32 +416,33 @@
     document.getElementById("connPinValue").textContent = pinLabel;
 
     // Workspace primary onboarding CTA & Quick / Tailscale / first-run notice
-    const isExternallyConnected = tState.state === "connected" && tState.mode !== "none";
-    document.getElementById("btnGoConnect").classList.toggle("btn-primary", !isExternallyConnected);
+    document.getElementById("btnGoConnect").classList.toggle("btn-primary", !isExternallyConnected && !hasLocalClient);
 
     const noticeEl = document.getElementById("wsTunnelNotice");
     if (tState.mode === "quick") {
       noticeEl.hidden = false;
       noticeEl.className = "notice";
       noticeEl.textContent =
-        "주의: Quick Tunnel 주소는 서버를 껐다 켜면 새로 발급되므로, 재시작할 때마다 gemini.google.com 커넥터를 다시 등록해야 합니다.";
+        "주의: Quick Tunnel 주소는 서버를 껐다 켜면 새로 발급되므로, 재시작할 때마다 커넥터를 다시 등록해야 합니다.";
     } else if (tState.mode === "tailscale" && tState.state === "connected") {
       noticeEl.hidden = false;
       noticeEl.className = "notice is-ok";
       noticeEl.textContent =
         "고정 주소 활성: Tailscale Funnel URL은 서버를 껐다 켜도 동일하게 유지됩니다.";
+    } else if (!isExternallyConnected && tState.mode === "none" && hasLocalClient) {
+      noticeEl.hidden = false;
+      noticeEl.className = "notice is-ok";
+      noticeEl.textContent =
+        "한국 리전 로컬 MCP(stdio) 연동 완료: gemini.google.com 웹 맞춤 앱이 없어도 Gemini CLI(`gemini`) 등에서 바로 도구를 쓸 수 있습니다. 일반 웹 채팅에서는 아래 '파일 트리 + Git diff 자동 첨부'를 켜고 프롬프트를 보내세요.";
     } else if (!isExternallyConnected && tState.mode === "none") {
       noticeEl.hidden = false;
       noticeEl.className = "notice";
       if (data.tailscaleStatus && data.tailscaleStatus.running && data.tailscaleStatus.dnsName) {
         noticeEl.textContent =
-          "외부 HTTPS 터널이 아직 꺼져 있습니다. Tailscale이 준비되어 있으니 '터널 / 로그인 설정'에서 Tailscale Funnel을 켜면 고정 HTTPS 주소가 바로 연결됩니다.";
-      } else if (data.cloudflaredInstalled) {
-        noticeEl.textContent =
-          "외부 HTTPS 터널이 아직 꺼져 있습니다. '터널 / 로그인 설정'에서 Quick Tunnel 또는 Tailscale Funnel을 켜야 gemini.google.com 커넥터에 등록할 수 있습니다.";
+          "외부 HTTPS 터널이 꺼져 있습니다. 한국 리전에서 웹 '맞춤 앱'이 막힌 경우 '연결 및 로그인'에서 Gemini CLI 1클릭 연동을 쓰거나, Developer Mode 계정은 Tailscale Funnel을 켜세요.";
       } else {
         noticeEl.textContent =
-          "외부 HTTPS 터널이 아직 꺼져 있습니다. '터널 / 로그인 설정'에서 Tailscale(추천) 또는 cloudflared 설치 안내를 확인하고 HTTPS 터널을 켜세요.";
+          "한국 리전에서는 gemini.google.com 웹 '맞춤 앱'이 제한될 수 있습니다. '연결 및 로그인'에서 Gemini CLI 1클릭 연동(터널 불필요) 또는 외부 HTTPS 터널 설정을 진행하세요.";
       }
     } else {
       noticeEl.hidden = true;
@@ -443,7 +467,9 @@
     }
     document.getElementById("composerContextBadge").textContent = `허용 폴더 ${roots.length}개`;
 
-    // Connect & Login view
+    // Connect & Login view (local stdio MCP clients)
+    renderLocalClients(data.localClients);
+
     const bpBadge = document.getElementById("browserProfileBadge");
     bpBadge.className = bp.initialized ? "status-pill is-ok" : "status-pill";
     bpBadge.textContent = bp.initialized ? "전용 프로필 초기화됨" : "첫 로그인 대기";
@@ -488,12 +514,33 @@
     }
 
     // Tunnel Options meta & radio selection
+    const pm = data.platformMeta || {};
+    const cfHint = pm.cloudflaredInstallHint || "brew install cloudflared";
+    const tsHint = pm.tailscaleInstallHint || "brew install --cask tailscale";
     const tsMeta = document.getElementById("optTailscaleMeta");
     tsMeta.textContent = data.tailscaleStatus ? `상태: ${data.tailscaleStatus.detail}` : "확인 중";
     const cfMeta = document.getElementById("optQuickMeta");
     cfMeta.textContent = data.cloudflaredInstalled
       ? "상태: cloudflared 준비됨"
-      : "상태: cloudflared 미설치 (brew install cloudflared)";
+      : `상태: cloudflared 미설치 (${cfHint})`;
+
+    const keepAwakeTitleEl = document.getElementById("keepAwakeTitle");
+    if (keepAwakeTitleEl && pm.keepAwakeLabel) {
+      keepAwakeTitleEl.textContent = pm.keepAwakeLabel;
+    }
+    const pickerLabelEl = document.getElementById("btnPickRootFinderLabel");
+    if (pickerLabelEl && pm.folderPickerLabel) {
+      pickerLabelEl.textContent = pm.folderPickerLabel;
+    }
+    const railPickEl = document.getElementById("railPickRoot");
+    if (railPickEl && pm.folderPickerLabel) {
+      railPickEl.title = pm.folderPickerLabel;
+      railPickEl.setAttribute("aria-label", pm.folderPickerLabel);
+    }
+    const svcTitleEl = document.getElementById("servicePanelTitle");
+    if (svcTitleEl && pm.serviceTitle) {
+      svcTitleEl.textContent = pm.serviceTitle;
+    }
 
     const connPill = document.getElementById("connTunnelStatePill");
     connPill.className = pillEl.className;
@@ -543,7 +590,7 @@
       tsNotice.hidden = false;
       tsNotice.className = "notice";
       tsNotice.textContent =
-        "외부 터널 도구가 아직 설치되어 있지 않습니다. 터미널에서 'brew install --cask tailscale' (추천·고정주소) 또는 'brew install cloudflared' 실행 후 다시 시도하세요.";
+        `외부 터널 도구가 아직 설치되어 있지 않습니다. 터미널에서 '${tsHint}' (추천·고정주소) 또는 '${cfHint}' 실행 후 다시 시도하세요.`;
     } else {
       tsNotice.hidden = true;
     }
@@ -563,9 +610,10 @@
     // Service status
     const svc = data.serviceStatus || {};
     const svcBadge = document.getElementById("serviceBadge");
+    const svcPath = svc.servicePath || svc.plistPath;
     if (!svc.supported) {
       svcBadge.className = "status-pill";
-      svcBadge.textContent = "macOS 전용";
+      svcBadge.textContent = "미지원 OS";
     } else if (svc.loaded) {
       svcBadge.className = "status-pill is-ok";
       svcBadge.textContent = "자동 실행 활성";
@@ -579,9 +627,9 @@
       svcBadge.className = "status-pill";
       svcBadge.textContent = "미등록";
     }
-    document.getElementById("serviceDetailText").textContent = svc.plistPath
-      ? `서비스 라벨: ${svc.label} (${svc.plistPath})`
-      : "macOS 로그인 시 자동으로 백그라운드 실행되도록 등록할 수 있습니다.";
+    document.getElementById("serviceDetailText").textContent = svcPath
+      ? `서비스 라벨: ${svc.label} (${svcPath})`
+      : "시스템 로그인 시 자동으로 백그라운드 실행되도록 등록할 수 있습니다.";
 
     // Files root selector sync (memoized; reset explorerPath when active root disappears)
     const filesSelect = document.getElementById("filesRootSelect");
@@ -621,6 +669,115 @@
       renderAuditRows(document.getElementById("wsAuditBody"), recentSlice);
     }
     renderFilteredAudit(recent);
+  }
+
+  function renderLocalClients(localClients) {
+    const lc = localClients || { clients: [], snippetJson: "" };
+    const clients = Array.isArray(lc.clients) ? lc.clients : [];
+    const registeredCount = clients.filter((c) => c.registered).length;
+    const badge = document.getElementById("localClientsBadge");
+    if (badge) {
+      badge.className = registeredCount > 0 ? "status-pill is-ok" : "status-pill";
+      badge.textContent = registeredCount > 0 ? `${registeredCount}개 클라이언트 연동됨` : "미등록";
+    }
+    const snippetBox = document.getElementById("stdioSnippetBox");
+    if (snippetBox && typeof lc.snippetJson === "string" && lc.snippetJson !== lastSnippetJson) {
+      lastSnippetJson = lc.snippetJson;
+      snippetBox.textContent = lc.snippetJson.trimEnd();
+    }
+
+    const listEl = document.getElementById("localClientsList");
+    if (!listEl) return;
+    const key = JSON.stringify(clients);
+    if (key === lastLocalClientsKey) return;
+    lastLocalClientsKey = key;
+
+    listEl.replaceChildren();
+    for (const c of clients) {
+      const row = document.createElement("div");
+      row.className = "client-row";
+
+      const info = document.createElement("div");
+      info.className = "client-info";
+
+      const head = document.createElement("div");
+      head.className = "client-head";
+
+      const title = document.createElement("strong");
+      title.textContent = c.label;
+
+      const pill = document.createElement("span");
+      if (c.registered && c.upToDate) {
+        pill.className = "status-pill is-ok";
+        pill.textContent = "연동됨";
+      } else if (c.registered) {
+        pill.className = "status-pill is-warn";
+        pill.textContent = "경로 갱신 필요";
+      } else {
+        pill.className = "status-pill";
+        pill.textContent = "미등록";
+      }
+      head.append(title, pill);
+
+      if (typeof c.cliInstalled === "boolean") {
+        const cliTag = document.createElement("span");
+        cliTag.className = "tag";
+        cliTag.textContent = c.cliInstalled ? "CLI 설치됨" : "CLI 미설치";
+        head.append(cliTag);
+      }
+
+      const pathEl = document.createElement("div");
+      pathEl.className = "client-path";
+      pathEl.textContent = c.configPath;
+
+      info.append(head, pathEl);
+
+      const actions = document.createElement("div");
+      actions.className = "row-actions";
+
+      const regBtn = document.createElement("button");
+      regBtn.type = "button";
+      regBtn.className = c.registered && c.upToDate ? "btn btn-compact" : "btn btn-primary btn-compact";
+      regBtn.textContent = c.registered ? (c.upToDate ? "재적용" : "경로 갱신") : "자동 등록";
+      regBtn.onclick = async () => {
+        setBusy(regBtn, true, "등록 중...");
+        try {
+          await apiPost("/_local/clients/register", { client: c.id });
+          showToast(
+            c.id === "gemini-cli"
+              ? "Gemini CLI 등록 완료! 터미널에서 `gemini` 실행 후 `/mcp`로 연결하세요."
+              : `${c.label}에 Gemination stdio MCP를 등록했습니다.`,
+          );
+          await refresh();
+        } catch (err) {
+          showToast(err.message);
+        } finally {
+          setBusy(regBtn, false);
+        }
+      };
+
+      const unregBtn = document.createElement("button");
+      unregBtn.type = "button";
+      unregBtn.className = "btn btn-compact";
+      unregBtn.textContent = "해제";
+      unregBtn.disabled = !c.registered;
+      unregBtn.onclick = async () => {
+        setBusy(unregBtn, true, "해제 중...");
+        try {
+          await apiPost("/_local/clients/unregister", { client: c.id });
+          showToast(`${c.label} 연동을 해제했습니다.`);
+          await refresh();
+        } catch (err) {
+          showToast(err.message);
+        } finally {
+          setBusy(unregBtn, false);
+        }
+      };
+
+      actions.append(regBtn, unregBtn);
+      row.append(info, actions);
+      listEl.append(row);
+    }
   }
 
   function renderFilteredAudit(entries) {
@@ -820,7 +977,11 @@
   document.getElementById("btnGoConnect").addEventListener("click", () => switchView("connect"));
   document.getElementById("stepCardTunnel").addEventListener("click", () => {
     switchView("connect");
-    document.getElementById("connectTunnelPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    const tState = state?.tunnelState || {};
+    const isExt = tState.state === "connected" && tState.mode && tState.mode !== "none";
+    const hasLocal = Array.isArray(state?.localClients?.clients) && state.localClients.clients.some((c) => c.registered);
+    const targetId = !isExt && hasLocal ? "connectLocalClientsPanel" : "connectTunnelPanel";
+    document.getElementById(targetId).scrollIntoView({ behavior: "smooth", block: "start" });
   });
   document.getElementById("stepCardBrowser").addEventListener("click", () => {
     switchView("connect");
@@ -828,7 +989,10 @@
   });
   document.getElementById("stepCardOAuth").addEventListener("click", () => {
     switchView("connect");
-    document.getElementById("connectGuidePanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    const activeTokens = Number(state?.oauthSummary?.activeTokenCount || 0);
+    const hasLocal = Array.isArray(state?.localClients?.clients) && state.localClients.clients.some((c) => c.registered);
+    const targetId = activeTokens === 0 && hasLocal ? "connectLocalClientsPanel" : "connectGuidePanel";
+    document.getElementById(targetId).scrollIntoView({ behavior: "smooth", block: "start" });
   });
   document.getElementById("btnSeeAllActivity").addEventListener("click", () => switchView("activity"));
 
@@ -853,9 +1017,12 @@
     applyTheme(current === "dark" ? "light" : "dark");
   });
 
-  async function openGemini(mode, extraMessagePrefix) {
+  async function openGemini(mode, extraMessagePrefix, urlOverride) {
     try {
-      const res = await apiPost("/_local/browser/open-gemini", { mode });
+      const res = await apiPost("/_local/browser/open-gemini", {
+        mode,
+        ...(urlOverride ? { url: urlOverride } : {}),
+      });
       const msg = res.usedMode === "dedicated-chrome"
         ? "전용 Chrome 창으로 Gemini를 열었습니다."
         : res.usedMode === "system-browser"
@@ -864,14 +1031,37 @@
       showToast(extraMessagePrefix ? `${extraMessagePrefix} ${msg}` : msg);
       await refresh();
     } catch (err) {
-      window.open("https://gemini.google.com/app", "_blank", "noopener,noreferrer");
+      window.open(urlOverride || "https://gemini.google.com/app", "_blank", "noopener,noreferrer");
       showToast(err.message);
     }
   }
 
   document.getElementById("topbarOpenGemini").addEventListener("click", () => void openGemini("dedicated"));
   document.getElementById("btnOpenDedicatedGemini").addEventListener("click", () => void openGemini("dedicated"));
+  document.getElementById("btnOpenGeminiDevMode").addEventListener("click", () =>
+    void openGemini("dedicated", "", "https://gemini.google.com/devmode"),
+  );
   document.getElementById("btnOpenDefaultGemini").addEventListener("click", () => void openGemini("default"));
+
+  document.getElementById("btnCopyGeminiInstall").addEventListener("click", async () => {
+    const cmd = document.getElementById("geminiInstallCmd")?.textContent || "npm install -g @google/gemini-cli";
+    try {
+      await navigator.clipboard.writeText(cmd);
+      showToast("Gemini CLI 설치 명령을 복사했습니다.");
+    } catch {
+      showToast(cmd);
+    }
+  });
+
+  document.getElementById("btnCopyStdioSnippet").addEventListener("click", async () => {
+    const snippet = state?.localClients?.snippetJson || document.getElementById("stdioSnippetBox")?.textContent || "";
+    try {
+      await navigator.clipboard.writeText(snippet);
+      showToast("stdio MCP JSON 설정을 복사했습니다.");
+    } catch {
+      showToast("JSON 복사 실패 — 위 박스 내용을 직접 복사하세요.");
+    }
+  });
 
   document.getElementById("btnResetBrowserProfile").addEventListener("click", async (e) => {
     if (!window.confirm("전용 Chrome 프로필(Google 로그인 세션 포함)을 초기화할까요?")) return;
@@ -937,16 +1127,39 @@
   document.getElementById("btnRailKill").addEventListener("click", (e) => void revokeAllAction(e.currentTarget));
   document.getElementById("btnConnRevokeAll").addEventListener("click", (e) => void revokeAllAction(e.currentTarget));
 
-  document.getElementById("btnLaunchTask").addEventListener("click", async () => {
+  document.getElementById("btnLaunchTask").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
     const prompt = (document.getElementById("composerInput").value || "").trim();
     const targetRoot = document.getElementById("composerRootSelect").value || "";
-    const composed = prompt
+    const attachContext = Boolean(document.getElementById("chkAttachContext")?.checked);
+    let composed = prompt
       ? `[로컬 작업 폴더: ${targetRoot}]\n${prompt}`
       : `[로컬 작업 폴더: ${targetRoot}] local_info와 list_directory로 프로젝트 구조를 먼저 파악해줘.`;
     let prefix = "";
+    let contextAttached = false;
+    let packFailed = false;
+    if (attachContext) {
+      setBusy(btn, true, "컨텍스트 생성 중...");
+      try {
+        const pack = await apiPost("/_local/context-pack", { root: targetRoot, prompt });
+        if (pack && typeof pack.composedPrompt === "string") {
+          composed = pack.composedPrompt;
+          contextAttached = true;
+        }
+      } catch (err) {
+        packFailed = true;
+        showToast(`컨텍스트 첨부 실패 (기본 프롬프트로 대체): ${err.message}`);
+      } finally {
+        setBusy(btn, false);
+      }
+    }
     try {
       await navigator.clipboard.writeText(composed);
-      prefix = "프롬프트를 복사했고";
+      prefix = contextAttached
+        ? "컨텍스트+프롬프트를 복사했고"
+        : packFailed
+          ? "기본 프롬프트를 복사했고"
+          : "프롬프트를 복사했고";
     } catch {
       prefix = "";
     }
@@ -1034,10 +1247,15 @@
   );
 
   async function pickFolderViaFinder(btn) {
-    setBusy(btn, true, "Finder 대기...");
+    setBusy(btn, true, "폴더 선택 중...");
     try {
       const res = await apiPost("/_local/roots/pick");
-      if (res.cancelled) {
+      if (res.unsupported) {
+        showToast("네이티브 폴더 선택기가 없어 직접 경로 입력창으로 이동합니다.");
+        switchView("settings");
+        const inputEl = document.getElementById("settingsAddRootInput");
+        if (inputEl) inputEl.focus();
+      } else if (res.cancelled) {
         showToast("폴더 선택이 취소되었습니다.");
       } else {
         showToast(`작업 폴더 추가됨: ${res.added}`);

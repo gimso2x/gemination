@@ -1,7 +1,9 @@
 import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { expandTilde, normalizeRoots } from "./config.ts";
+import { killProcessGracefully } from "./platform.ts";
 import type { GeminationConfig } from "./types.ts";
 
 export class LinePrompt {
@@ -56,6 +58,15 @@ export class LinePrompt {
   }
 }
 
+function isPickerDisabled(): boolean {
+  return (
+    process.env.CI === "1"
+    || process.env.CI === "true"
+    || process.env.GEMINATION_NO_FINDER === "1"
+    || process.env.GEMINATION_NO_PICKER === "1"
+  );
+}
+
 function getMacOsFinderArgs(osascriptBin: string, promptText: string): string[] {
   return [
     osascriptBin,
@@ -70,44 +81,105 @@ function getMacOsFinderArgs(osascriptBin: string, promptText: string): string[] 
   ];
 }
 
-export function pickFolderWithMacOsFinder(promptText = "Gemini가 접근할 작업 폴더를 선택하세요"): string | null {
-  if (process.platform !== "darwin") return null;
-  if (process.env.CI === "1" || process.env.CI === "true" || process.env.GEMINATION_NO_FINDER === "1") {
-    return null;
-  }
-  const osascriptBin = Bun.which("osascript");
-  if (!osascriptBin) return null;
+function getWindowsFolderDialogScript(): string {
+  return [
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$d = New-Object System.Windows.Forms.FolderBrowserDialog",
+    "$d.Description = if ($env:GEMINATION_DIALOG_PROMPT) { $env:GEMINATION_DIALOG_PROMPT } else { 'Select Workspace Folder' }",
+    "$d.ShowNewFolderButton = $true",
+    "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }",
+  ].join("; ");
+}
 
-  const res = Bun.spawnSync(getMacOsFinderArgs(osascriptBin, promptText), {
+function getWindowsPowerShellBinary(): string | null {
+  const pwsh = Bun.which("powershell")
+    ?? Bun.which("pwsh")
+    ?? (existsSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+      ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+      : null);
+  return pwsh;
+}
+
+function getFolderPickerInvocation(
+  promptText: string,
+  platform: string = process.platform,
+): { cmd: string[]; env?: NodeJS.ProcessEnv } | null {
+  if (platform === "darwin") {
+    const osascriptBin = Bun.which("osascript");
+    if (!osascriptBin) return null;
+    return { cmd: getMacOsFinderArgs(osascriptBin, promptText) };
+  }
+
+  if (platform === "win32") {
+    const psBin = getWindowsPowerShellBinary();
+    if (!psBin) return null;
+    return {
+      cmd: [psBin, "-NoProfile", "-STA", "-Command", getWindowsFolderDialogScript()],
+      env: { ...process.env, GEMINATION_DIALOG_PROMPT: promptText },
+    };
+  }
+
+  const zenity = Bun.which("zenity");
+  if (zenity) {
+    return {
+      cmd: [zenity, "--file-selection", "--directory", `--title=${promptText}`],
+    };
+  }
+
+  const kdialog = Bun.which("kdialog");
+  if (kdialog) {
+    return {
+      cmd: [kdialog, "--getexistingdirectory", homedir(), "--title", promptText],
+    };
+  }
+
+  return null;
+}
+
+export function isNativeFolderPickerAvailable(platform: string = process.platform): boolean {
+  if (isPickerDisabled()) return false;
+  if (platform === "darwin") return Boolean(Bun.which("osascript"));
+  if (platform === "win32") return Boolean(getWindowsPowerShellBinary());
+  return Boolean(Bun.which("zenity") || Bun.which("kdialog"));
+}
+
+function cleanPickedPath(rawStdout: string): string | null {
+  const trimmed = rawStdout.trim();
+  if (!trimmed) return null;
+  if (/^[A-Za-z]:\\$/.test(trimmed)) return trimmed;
+  return trimmed.replace(/[/\\]+$/, "") || trimmed;
+}
+
+export function pickFolderDialog(promptText = "Gemini가 접근할 작업 폴더를 선택하세요"): string | null {
+  if (isPickerDisabled()) return null;
+  const invocation = getFolderPickerInvocation(promptText);
+  if (!invocation) return null;
+
+  const res = Bun.spawnSync(invocation.cmd, {
     stdout: "pipe",
     stderr: "pipe",
+    env: invocation.env ?? process.env,
     timeout: 60_000,
   });
   if (res.exitCode !== 0) return null;
-  const picked = Buffer.from(res.stdout).toString("utf8").trim().replace(/\/+$/, "");
-  return picked || null;
+  return cleanPickedPath(Buffer.from(res.stdout).toString("utf8"));
 }
 
-export async function pickFolderWithMacOsFinderAsync(
+export async function pickFolderDialogAsync(
   promptText = "Gemini가 접근할 작업 폴더를 선택하세요",
 ): Promise<string | null> {
-  if (process.platform !== "darwin") return null;
-  if (process.env.CI === "1" || process.env.CI === "true" || process.env.GEMINATION_NO_FINDER === "1") {
-    return null;
-  }
-  const osascriptBin = Bun.which("osascript");
-  if (!osascriptBin) return null;
+  if (isPickerDisabled()) return null;
+  const invocation = getFolderPickerInvocation(promptText);
+  if (!invocation) return null;
 
-  const proc = Bun.spawn(getMacOsFinderArgs(osascriptBin, promptText), {
+  const proc = Bun.spawn(invocation.cmd, {
     stdout: "pipe",
     stderr: "pipe",
+    env: invocation.env ?? process.env,
   });
   const timer = setTimeout(() => {
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Already exited.
-    }
+    killProcessGracefully(proc, false);
   }, 60_000);
   try {
     const [stdoutBuf, exitCode] = await Promise.all([
@@ -115,27 +187,58 @@ export async function pickFolderWithMacOsFinderAsync(
       proc.exited,
     ]);
     if (exitCode !== 0) return null;
-    const picked = Buffer.from(stdoutBuf).toString("utf8").trim().replace(/\/+$/, "");
-    return picked || null;
+    return cleanPickedPath(Buffer.from(stdoutBuf).toString("utf8"));
   } finally {
     clearTimeout(timer);
   }
 }
 
-export function openInBrowser(url: string): boolean {
+export const pickFolderWithMacOsFinder = pickFolderDialog;
+export const pickFolderWithMacOsFinderAsync = pickFolderDialogAsync;
+
+export function openInBrowser(url: string, platform: string = process.platform): boolean {
   if (process.env.CI === "1" || process.env.CI === "true" || process.env.GEMINATION_NO_OPEN === "1") {
     return false;
   }
+  if (/[\s\r\n\0"']/.test(url)) {
+    return false;
+  }
+  let safeUrl: string;
   try {
-    if (process.platform === "darwin") {
-      const proc = Bun.spawn(["open", url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+    safeUrl = parsed.toString();
+  } catch {
+    return false;
+  }
+  try {
+    if (platform === "darwin") {
+      const proc = Bun.spawn(["open", safeUrl], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
       void proc.exited;
       return true;
     }
-    if (process.platform === "linux" && Bun.which("xdg-open")) {
-      const proc = Bun.spawn(["xdg-open", url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-      void proc.exited;
+    if (platform === "win32") {
+      const proc = Bun.spawn(["rundll32.exe", "url.dll,FileProtocolHandler", safeUrl], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        detached: true,
+      });
+      proc.unref();
       return true;
+    }
+    for (const cmd of [
+      Bun.which("xdg-open") ? ["xdg-open", safeUrl] : null,
+      Bun.which("gio") ? ["gio", "open", safeUrl] : null,
+      Bun.which("sensible-browser") ? ["sensible-browser", safeUrl] : null,
+    ]) {
+      if (cmd) {
+        const proc = Bun.spawn(cmd, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+        void proc.exited;
+        return true;
+      }
     }
   } catch {
     return false;
@@ -143,17 +246,39 @@ export function openInBrowser(url: string): boolean {
   return false;
 }
 
-export function tryBrewInstall(kind: "tailscale" | "cloudflared"): boolean {
-  if (process.platform !== "darwin" || process.env.CI === "1" || process.env.CI === "true") {
+export function canAutoInstallPackages(platform: string = process.platform): boolean {
+  if (process.env.CI === "1" || process.env.CI === "true") return false;
+  if (platform === "darwin") return Boolean(Bun.which("brew"));
+  if (platform === "win32") return Boolean(Bun.which("winget"));
+  return false;
+}
+
+export function tryAutoInstallTool(
+  kind: "tailscale" | "cloudflared",
+  platform: string = process.platform,
+): boolean {
+  if (process.env.CI === "1" || process.env.CI === "true") {
     return false;
   }
-  const brewBin = Bun.which("brew");
-  if (!brewBin) return false;
 
-  const args =
-    kind === "tailscale"
-      ? [brewBin, "install", "--cask", "tailscale"]
-      : [brewBin, "install", "cloudflared"];
+  let args: string[] | null = null;
+  if (platform === "darwin") {
+    const brewBin = Bun.which("brew");
+    if (brewBin) {
+      args =
+        kind === "tailscale"
+          ? [brewBin, "install", "--cask", "tailscale"]
+          : [brewBin, "install", "cloudflared"];
+    }
+  } else if (platform === "win32") {
+    const wingetBin = Bun.which("winget");
+    if (wingetBin) {
+      const id = kind === "tailscale" ? "Tailscale.Tailscale" : "Cloudflare.cloudflared";
+      args = [wingetBin, "install", "--id", id, "-e"];
+    }
+  }
+
+  if (!args) return false;
 
   const res = Bun.spawnSync(args, {
     stdin: "inherit",
@@ -163,6 +288,8 @@ export function tryBrewInstall(kind: "tailscale" | "cloudflared"): boolean {
   });
   return res.exitCode === 0;
 }
+
+export const tryBrewInstall = tryAutoInstallTool;
 
 export function formatPermissionPresetLabel(config: GeminationConfig): string {
   const mode = !config.allowWrite && !config.allowShell
@@ -180,16 +307,24 @@ export async function promptWorkspaceAndPermissions(
   prompter: LinePrompt,
   config: GeminationConfig,
   output: NodeJS.WritableStream,
-  options: { allowMacOsFinder?: boolean } = {},
+  options: { allowMacOsFinder?: boolean; allowNativePicker?: boolean } = {},
 ): Promise<{ cancelled: boolean; config: GeminationConfig }> {
   const updated: GeminationConfig = {
     ...config,
     roots: [...config.roots],
   };
 
-  const canFinder = Boolean(
-    options.allowMacOsFinder ?? (process.platform === "darwin" && Boolean((output as { isTTY?: boolean }).isTTY)),
+  const canPicker = Boolean(
+    options.allowNativePicker
+      ?? options.allowMacOsFinder
+      ?? (isNativeFolderPickerAvailable() && Boolean((output as { isTTY?: boolean }).isTTY)),
   );
+  const pickerDesc =
+    process.platform === "darwin"
+      ? "macOS Finder 창에서 폴더 선택 (추가/변경)"
+      : process.platform === "win32"
+        ? "Windows 탐색기 창에서 폴더 선택 (추가/변경)"
+        : "시스템 폴더 선택 창 열기 (추가/변경)";
 
   output.write(
     [
@@ -199,15 +334,15 @@ export async function promptWorkspaceAndPermissions(
       "------------------------------------------------------------",
       `  현재 폴더: ${updated.roots.join(", ")}`,
       "  [1] 현재 폴더 그대로 유지 (기본값)",
-      ...(canFinder ? ["  [2] macOS Finder 창에서 폴더 선택 (추가/변경)"] : []),
-      `  [${canFinder ? "3" : "2"}] 폴더 경로 직접 입력 (쉼표 , 로 여러 개 지정 가능)`,
+      ...(canPicker ? [`  [2] ${pickerDesc}`] : []),
+      `  [${canPicker ? "3" : "2"}] 폴더 경로 직접 입력 (쉼표 , 로 여러 개 지정 가능)`,
       "  [b] 돌아가기",
       "",
     ].join("\n"),
   );
 
   while (true) {
-    const maxOpt = canFinder ? 3 : 2;
+    const maxOpt = canPicker ? 3 : 2;
     const raw = await prompter.ask(`폴더 설정 [1-${maxOpt}, b=돌아가기] (Enter = 1): `);
     if (raw === null) return { cancelled: true, config };
     const choice = (raw.trim() || "1").toLowerCase();
@@ -217,9 +352,9 @@ export async function promptWorkspaceAndPermissions(
     if (choice === "1") {
       break;
     }
-    if (canFinder && choice === "2") {
-      output.write("Finder 폴더 선택 창을 여는 중...\n");
-      const picked = pickFolderWithMacOsFinder();
+    if (canPicker && choice === "2") {
+      output.write("폴더 선택 창을 여는 중...\n");
+      const picked = pickFolderDialog();
       if (!picked) {
         output.write("[안내] 폴더 선택이 취소되었습니다. 다시 선택해주세요.\n");
         continue;
@@ -233,7 +368,7 @@ export async function promptWorkspaceAndPermissions(
       output.write(`[완료] 허용 폴더: ${updated.roots.join(", ")}\n`);
       break;
     }
-    if ((canFinder && choice === "3") || (!canFinder && choice === "2")) {
+    if ((canPicker && choice === "3") || (!canPicker && choice === "2")) {
       const pathAns = await prompter.ask("절대 또는 ~ 경로 입력 (예: ~/Projects, ~/Documents): ");
       if (pathAns === null) return { cancelled: true, config };
       const candidates = pathAns

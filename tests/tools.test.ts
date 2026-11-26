@@ -125,10 +125,50 @@ describe("Gemination MCP tools", () => {
   test("run_command, background process lifecycle, and git_inspect", async () => {
     const { client, close } = await connectTestClient();
     try {
+      await client.callTool({
+        name: "write_file",
+        arguments: {
+          path: "_run_helper.mjs",
+          content: [
+            'console.log("hello-stdout");',
+            'console.error("hello-stderr");',
+          ].join("\n"),
+        },
+      });
+      await client.callTool({
+        name: "write_file",
+        arguments: {
+          path: "_bg_helper.mjs",
+          content: [
+            'console.log("bg-ready");',
+            "setInterval(() => {}, 1000);",
+          ].join("\n"),
+        },
+      });
+      await client.callTool({
+        name: "write_file",
+        arguments: {
+          path: "_git_init.mjs",
+          content: [
+            'import { writeFileSync } from "node:fs";',
+            'const run = (cmd) => {',
+            '  const res = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });',
+            '  if (res.exitCode !== 0) throw new Error(Buffer.from(res.stderr).toString("utf8"));',
+            "};",
+            'run(["git", "init"]);',
+            'run(["git", "config", "user.email", "test@example.com"]);',
+            'run(["git", "config", "user.name", "test"]);',
+            'writeFileSync("a.txt", "a\\n", "utf8");',
+            'run(["git", "add", "a.txt"]);',
+            'run(["git", "commit", "-m", "init"]);',
+          ].join("\n"),
+        },
+      });
+
       const cmdRes = parseToolJson(
         await client.callTool({
           name: "run_command",
-          arguments: { command: "echo hello-stdout && echo hello-stderr >&2" },
+          arguments: { command: "bun _run_helper.mjs" },
         }),
       );
       expect(cmdRes.exitCode).toBe(0);
@@ -138,12 +178,12 @@ describe("Gemination MCP tools", () => {
       const started = parseToolJson(
         await client.callTool({
           name: "start_process",
-          arguments: { command: "echo bg-ready; sleep 5" },
+          arguments: { command: "bun _bg_helper.mjs" },
         }),
       );
       const procId = String(started.id);
       let polled: Record<string, unknown> = {};
-      const pollDeadline = Date.now() + 3_000;
+      const pollDeadline = Date.now() + 10_000;
       while (Date.now() < pollDeadline) {
         polled = parseToolJson(
           await client.callTool({
@@ -165,10 +205,13 @@ describe("Gemination MCP tools", () => {
       expect(stopped.status).toBe("killed");
 
       // Initialize git repo and inspect
-      await client.callTool({
-        name: "run_command",
-        arguments: { command: "git init && git config user.email test@example.com && git config user.name test && echo a > a.txt && git add a.txt && git commit -m init" },
-      });
+      const gitSetupRes = parseToolJson(
+        await client.callTool({
+          name: "run_command",
+          arguments: { command: "bun _git_init.mjs" },
+        }),
+      );
+      expect(gitSetupRes.exitCode).toBe(0);
       const gitStatus = parseToolJson(
         await client.callTool({ name: "git_inspect", arguments: { action: "status" } }),
       );
@@ -236,6 +279,18 @@ describe("Gemination MCP tools", () => {
         arguments: { path: ".git/config", content: "[core]\n\tfsmonitor = evil\n" },
       });
       expect(gitConfigWrite.isError).toBe(true);
+
+      const gitAdsWrite = await client.callTool({
+        name: "write_file",
+        arguments: { path: ".git/config::$DATA", content: "[core]\n\tfsmonitor = evil\n" },
+      });
+      expect(gitAdsWrite.isError).toBe(true);
+
+      const gitTrailingDotWrite = await client.callTool({
+        name: "write_file",
+        arguments: { path: ".git/hooks./pre-commit", content: "#!/bin/sh\necho pwn\n" },
+      });
+      expect(gitTrailingDotWrite.isError).toBe(true);
     } finally {
       await close();
     }

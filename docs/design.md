@@ -1,7 +1,7 @@
 # Gemination Studio Design System
 
 ## 1. Aesthetic Direction
-Gemination Studio is a local Agentic Development Environment (ADE) workbench for sustained coding sessions connecting `gemini.google.com` to a local Mac over MCP: calm, dense, operational tonal surfaces built with zero decorative clutter.
+Gemination Studio is a local Agentic Development Environment (ADE) workbench for sustained coding sessions connecting `gemini.google.com` or local MCP clients to a local PC (macOS, Windows, and Linux) over MCP: calm, dense, operational tonal surfaces built with zero decorative clutter.
 
 - **Mood**: quiet engineering tool, zero marketing hype, zero neon glows, zero decorative accent stripes.
 - **Icons**: monochrome 24x24 stroke SVG sprite only (`stroke-width: 1.7`, round caps/joins). Zero emojis in code or UI.

@@ -115,7 +115,7 @@
       <div class="rail-section">
         <div class="rail-head">
           <span>허용 워크스페이스</span>
-          <button class="btn-icon" id="railPickRoot" type="button" title="Finder에서 폴더 추가" aria-label="Finder에서 폴더 추가">
+          <button class="btn-icon" id="railPickRoot" type="button" title="폴더 추가" aria-label="폴더 추가">
             <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>
           </button>
         </div>
@@ -231,6 +231,10 @@
               <span>대상 폴더</span>
               <select id="composerRootSelect"></select>
             </label>
+            <label class="inline-check" for="chkAttachContext">
+              <input id="chkAttachContext" type="checkbox" checked>
+              <span>파일 트리 + Git diff 자동 첨부 (맞춤 앱 없는 한국 Gemini Web용)</span>
+            </label>
           </div>
           <label class="sr-only" for="composerInput">Gemini에게 지시할 작업 내용</label>
           <textarea
@@ -268,18 +272,43 @@
         <div class="view-head">
           <div>
             <h1 id="h-connect">연결 및 로그인</h1>
-            <p class="view-sub">전용 브라우저 프로필에서 Google 계정에 로그인하고, 외부 HTTPS 터널과 커넥터를 연결합니다.</p>
+            <p class="view-sub">한국 리전에서도 바로 쓰는 로컬 MCP 클라이언트(stdio) 연동과 Gemini Web 터널·로그인을 설정합니다.</p>
+          </div>
+        </div>
+
+        <div class="panel" id="connectLocalClientsPanel">
+          <div class="panel-head">
+            <h2>1. 한국 리전 즉시 연동 · 로컬 MCP 클라이언트 (맞춤 앱 · 터널 불필요)</h2>
+            <span class="status-pill" id="localClientsBadge">확인 중...</span>
+          </div>
+          <div class="notice">
+            <span>
+              현재 Google 정책상 <strong>gemini.google.com '맞춤 앱(Custom Apps)'은 미국(US)·영어 개인 계정에만 제한</strong>되어 한국 계정에서는 메뉴가 차단될 수 있습니다. 아래 <strong>Gemini CLI (Google 계정 로그인 · 한국 리전 완전 지원)</strong> 또는 Claude·Cursor에 1클릭 등록하면 외부 터널 없이 12개 로컬 도구를 바로 사용할 수 있습니다.
+            </span>
+          </div>
+          <div class="client-list" id="localClientsList"></div>
+          <div class="mono-row subtle-path">
+            <span class="field-label">Gemini CLI 설치</span>
+            <code id="geminiInstallCmd">npm install -g @google/gemini-cli</code>
+            <button class="btn btn-compact" id="btnCopyGeminiInstall" type="button">복사</button>
+          </div>
+          <div class="sub-divider">
+            <div class="sub-head">
+              <strong>기타 MCP 클라이언트용 stdio 설정 (VS Code / Antigravity 등)</strong>
+              <button class="btn btn-compact" id="btnCopyStdioSnippet" type="button">JSON 복사</button>
+            </div>
+            <pre class="code-box" id="stdioSnippetBox">로딩 중...</pre>
           </div>
         </div>
 
         <div class="panel" id="connectLoginPanel">
           <div class="panel-head">
-            <h2>1. Gemini Web 로그인 (전용 브라우저 프로필)</h2>
+            <h2>2. Gemini Web 로그인 (전용 브라우저 프로필)</h2>
             <span class="status-pill" id="browserProfileBadge">확인 중...</span>
           </div>
           <p class="panel-desc">
-            Gemination은 비밀번호를 저장하지 않습니다. 아래 버튼으로 열리는 <strong>전용 Chrome 프로필</strong>에서 한 번만 Google 로그인을 해두면,
-            이후 창을 열 때마다 로그인 상태가 유지됩니다.
+            Gemination은 비밀번호를 저장하지 않습니다. 아래 버튼으로 열리는 <strong>전용 Chrome 프로필</strong>에서 Google 로그인을 해두면,
+            한국 Web 채팅(컨텍스트 자동 첨부) 또는 Developer Mode 창에서 세션을 유지한 채 열립니다.
           </p>
           <div class="mono-row subtle-path">
             <span class="field-label">프로필 경로</span>
@@ -290,6 +319,7 @@
               <svg class="ico" viewBox="0 0 24 24"><use href="#i-out" /></svg>
               <span>전용 Chrome으로 Gemini 로그인 / 열기</span>
             </button>
+            <button class="btn" id="btnOpenGeminiDevMode" type="button">Gemini Developer Mode 열기</button>
             <button class="btn" id="btnOpenDefaultGemini" type="button">기본 브라우저로 열기</button>
             <button class="btn btn-danger" id="btnResetBrowserProfile" type="button">전용 프로필 초기화</button>
           </div>
@@ -314,7 +344,7 @@
 
         <div class="panel" id="connectTunnelPanel">
           <div class="panel-head">
-            <h2>2. 외부 HTTPS 터널 선택</h2>
+            <h2>3. 외부 HTTPS 터널 선택 (미국/영어 계정 또는 Developer Mode용)</h2>
             <span class="status-pill" id="connTunnelStatePill">대기</span>
           </div>
           <div class="tunnel-options" id="tunnelOptions">
@@ -379,7 +409,7 @@
 
         <div class="panel" id="connectGuidePanel">
           <div class="panel-head">
-            <h2>3. Gemini 커넥터 등록 안내</h2>
+            <h2>4. Gemini Web 커넥터 등록 안내 (미국/영어 계정 또는 Developer Mode)</h2>
           </div>
           <ol class="steps-list">
             <li>Gemini Web 왼쪽 메뉴에서 <strong>Customize (맞춤설정) → Connectors (커넥터) → + Custom</strong> 을 선택합니다.</li>
@@ -520,7 +550,7 @@
         <div class="view-head">
           <div>
             <h1 id="h-settings">설정 및 보안</h1>
-            <p class="view-sub">허용 폴더, 실행 권한, 시크릿 마스킹 및 macOS 자동 시작 정책을 설정합니다.</p>
+            <p class="view-sub">허용 폴더, 실행 권한, 시크릿 마스킹 및 자동 시작 정책을 설정합니다.</p>
           </div>
         </div>
 
@@ -557,7 +587,7 @@
             </label>
             <label class="toggle-row">
               <div>
-                <strong>Mac 유휴 잠자기 방지 (caffeinate)</strong>
+                <strong id="keepAwakeTitle">유휴 잠자기 방지</strong>
                 <span>서버 실행 중 백그라운드 작업이 중단되지 않도록 시스템 유휴 수면을 막습니다.</span>
               </div>
               <input id="setKeepAwake" type="checkbox">
@@ -570,7 +600,7 @@
             <h2>허용된 작업 폴더 (Roots)</h2>
             <button class="btn btn-primary" id="btnPickRootFinder" type="button">
               <svg class="ico" viewBox="0 0 24 24"><use href="#i-folder" /></svg>
-              <span>Finder에서 폴더 선택</span>
+              <span id="btnPickRootFinderLabel">폴더 선택</span>
             </button>
           </div>
           <div class="roots-manage" id="settingsRootsList"></div>
@@ -583,10 +613,10 @@
 
         <div class="panel">
           <div class="panel-head">
-            <h2>macOS 백그라운드 상시 실행 (LaunchAgent)</h2>
+            <h2 id="servicePanelTitle">백그라운드 상시 실행 (자동 시작)</h2>
             <span class="status-pill" id="serviceBadge">확인 중...</span>
           </div>
-          <p class="panel-desc" id="serviceDetailText">macOS 로그인 시 자동으로 실행되도록 등록할 수 있습니다.</p>
+          <p class="panel-desc" id="serviceDetailText">시스템 로그인 시 자동으로 실행되도록 등록할 수 있습니다.</p>
           <div class="mono-row subtle-path">
             <code>bun run service:install   # 등록 · bun run service:uninstall   # 해제</code>
           </div>

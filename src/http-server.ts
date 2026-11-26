@@ -1,13 +1,14 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { version as PKG_VERSION } from "../package.json";
 import {
   GEMINI_WEB_URL,
   getBrowserProfileStatus,
   openGeminiLoginWindow,
-  openTailscaleMacApp,
+  openTailscaleApp,
   resetDedicatedBrowserProfile,
 } from "./browser-launcher.ts";
 import { expandTilde, normalizeRoots, saveConfig } from "./config.ts";
@@ -19,16 +20,35 @@ import {
   isValidLocalCsrf,
   renderDashboardHtml,
 } from "./dashboard.ts";
+import {
+  detectLocalClients,
+  isLocalMcpClientId,
+  registerLocalClient,
+  unregisterLocalClient,
+} from "./mcp-clients.ts";
 import type { OAuthServer } from "./oauth.ts";
+import { getPlatformUiMeta, killProcessGracefully } from "./platform.ts";
 import type { KeepAwakeController } from "./power.ts";
 import type { ProcessManager } from "./process-manager.ts";
 import { maskSecrets } from "./secrets-shield.ts";
-import { AuditLogger, isPathInside, resolveSafePath, SecurityError } from "./security.ts";
-import { getLaunchAgentStatus } from "./service.ts";
-import { pickFolderWithMacOsFinderAsync } from "./setup-wizard.ts";
+import {
+  AuditLogger,
+  buildSanitizedChildEnv,
+  getSensitiveDeniedPaths,
+  isPathInside,
+  resolveSafePath,
+  SecurityError,
+} from "./security.ts";
+import { getBackgroundServiceStatus } from "./service.ts";
+import { isNativeFolderPickerAvailable, pickFolderDialogAsync } from "./setup-wizard.ts";
 import { createGeminationMcpServer, SAFE_GIT_ARGS } from "./tools.ts";
 import type { TunnelController } from "./tunnel-controller.ts";
-import { inspectTailscaleStatusAsync, type PublicProbeResult, type TailscaleStatusInfo } from "./tunnel.ts";
+import {
+  findCloudflaredBinary,
+  inspectTailscaleStatusAsync,
+  type PublicProbeResult,
+  type TailscaleStatusInfo,
+} from "./tunnel.ts";
 import type { GeminationConfig, TailscaleFunnelPort, TunnelMode } from "./types.ts";
 
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
@@ -96,13 +116,10 @@ async function runGitCommandAsync(
     cwd,
     stdout: "pipe",
     stderr: "pipe",
+    env: { ...buildSanitizedChildEnv(), GIT_TERMINAL_PROMPT: "0" },
   });
   const timer = setTimeout(() => {
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Ignore.
-    }
+    killProcessGracefully(proc, true);
   }, timeoutMs);
   try {
     const [stdoutBuf, stderrBuf, exitCode] = await Promise.all([
@@ -156,7 +173,51 @@ export interface GeminationHttpServerHandle {
   stop: () => Promise<void>;
 }
 
+function collectWorkspaceTree(
+  rootDir: string,
+  deniedPaths: string[],
+  maxDepth = 2,
+  maxEntries = 120,
+): string[] {
+  const lines: string[] = [];
+  const skipNames = new Set([".git", "node_modules", ".DS_Store", "dist", "build"]);
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+
+  const walk = (dir: string, relPrefix: string, depth: number): void => {
+    if (lines.length >= maxEntries || depth > maxDepth) return;
+    let dirents;
+    try {
+      dirents = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    dirents.sort((a, b) => a.name.localeCompare(b.name));
+    for (const d of dirents) {
+      if (lines.length >= maxEntries) break;
+      if (skipNames.has(d.name)) continue;
+      const fullPath = join(dir, d.name);
+      if (d.isSymbolicLink()) continue;
+      if (deniedPaths.some((denied) => isPathInside(fullPath, denied, process.platform, caseInsensitive))) {
+        continue;
+      }
+      const rel = relPrefix ? `${relPrefix}/${d.name}` : d.name;
+      if (d.isDirectory()) {
+        lines.push(`${rel}/`);
+        if (depth < maxDepth) {
+          walk(fullPath, rel, depth + 1);
+        }
+      } else {
+        lines.push(rel);
+      }
+    }
+  };
+
+  walk(rootDir, "", 0);
+  return lines;
+}
+
 export function startGeminationHttpServer(options: HttpServerOptions): GeminationHttpServerHandle {
+  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   let explicitPublicBaseUrl = options.initialPublicBaseUrl?.replace(/\/+$/, "");
   const localCsrfToken = randomBytes(24).toString("hex");
   const startedAt = new Date().toISOString();
@@ -414,17 +475,20 @@ export function startGeminationHttpServer(options: HttpServerOptions): Geminatio
           probeStatus: runtimeMeta.probeStatus,
         };
         const tailscaleStatus = await getTailscaleStatusCached(options.config.tailscaleFunnelPort ?? 443);
-        const cloudflaredInstalled = Boolean(process.env.CLOUDFLARED_BIN?.trim() || Bun.which("cloudflared"));
+        const cloudflaredInstalled = Boolean(findCloudflaredBinary());
         const browserProfile = getBrowserProfileStatus(options.configDir);
         const rawProcesses = options.processManager.list();
         const processes = options.config.shieldSecrets
           ? rawProcesses.map((p) => ({ ...p, command: maskSecrets(p.command).text }))
           : rawProcesses;
-        const serviceStatus = getLaunchAgentStatus({
+        const serviceStatus = getBackgroundServiceStatus({
           configDir: options.configDir,
           profile: runtimeMeta.profile,
-          skipLaunchctl: true,
+          skipServiceControl: true,
         });
+        const platformMeta = getPlatformUiMeta();
+        const folderPickerSupported = isNativeFolderPickerAvailable();
+        const localClients = detectLocalClients(projectRoot, options.configDir);
 
         return localJson({
           ok: true,
@@ -436,6 +500,10 @@ export function startGeminationHttpServer(options: HttpServerOptions): Geminatio
           tunnelState: tSnap,
           probeStatus: tSnap.probeStatus ?? runtimeMeta.probeStatus,
           keepAwake: Boolean(runtimeMeta.keepAwake),
+          keepAwakeBackend: options.keepAwakeController?.getBackend?.() ?? "none",
+          platformMeta,
+          folderPickerSupported,
+          localClients,
           startedAt,
           latestPin: latestSessionPin,
           tailscaleStatus,
@@ -680,7 +748,15 @@ export function startGeminationHttpServer(options: HttpServerOptions): Geminatio
         }
 
         if (pathname === "/_local/roots/pick") {
-          const picked = await pickFolderWithMacOsFinderAsync();
+          if (!isNativeFolderPickerAvailable()) {
+            return localJson({
+              ok: true,
+              cancelled: true,
+              unsupported: true,
+              roots: options.config.roots,
+            });
+          }
+          const picked = await pickFolderDialogAsync();
           if (!picked) {
             return localJson({ ok: true, cancelled: true, roots: options.config.roots });
           }
@@ -698,12 +774,148 @@ export function startGeminationHttpServer(options: HttpServerOptions): Geminatio
             body = {};
           }
           const mode = body.mode === "default" ? "default" : "dedicated";
-          const urlParam =
-            typeof body.url === "string" && body.url.startsWith("https://gemini.google.com/")
-              ? body.url
-              : GEMINI_WEB_URL;
+          let urlParam = GEMINI_WEB_URL;
+          if (typeof body.url === "string" && !/[\s\r\n\0"']/.test(body.url)) {
+            try {
+              const parsedUrl = new URL(body.url);
+              if (parsedUrl.origin === "https://gemini.google.com") {
+                urlParam = parsedUrl.toString();
+              }
+            } catch {
+              urlParam = GEMINI_WEB_URL;
+            }
+          }
           const launched = openGeminiLoginWindow(options.configDir, { mode, url: urlParam });
           return localJson({ ok: true, ...launched });
+        }
+
+        if (pathname === "/_local/clients/register") {
+          let body: Record<string, unknown>;
+          try {
+            body = (await req.json()) as Record<string, unknown>;
+          } catch {
+            return localJson({ error: "JSON 본문 형식이 올바르지 않습니다." }, 400);
+          }
+          if (!isLocalMcpClientId(body.client)) {
+            return localJson({ error: "지원하지 않는 MCP 클라이언트입니다." }, 400);
+          }
+          persistConfig();
+          try {
+            const res = registerLocalClient(body.client, projectRoot, options.configDir);
+            return localJson({
+              ok: true,
+              ...res,
+              localClients: detectLocalClients(projectRoot, options.configDir),
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return localJson({ error: msg }, 400);
+          }
+        }
+
+        if (pathname === "/_local/clients/unregister") {
+          let body: Record<string, unknown>;
+          try {
+            body = (await req.json()) as Record<string, unknown>;
+          } catch {
+            return localJson({ error: "JSON 본문 형식이 올바르지 않습니다." }, 400);
+          }
+          if (!isLocalMcpClientId(body.client)) {
+            return localJson({ error: "지원하지 않는 MCP 클라이언트입니다." }, 400);
+          }
+          try {
+            const res = unregisterLocalClient(body.client);
+            return localJson({
+              ok: true,
+              ...res,
+              localClients: detectLocalClients(projectRoot, options.configDir),
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return localJson({ error: msg }, 400);
+          }
+        }
+
+        if (pathname === "/_local/context-pack") {
+          let body: Record<string, unknown>;
+          try {
+            body = (await req.json()) as Record<string, unknown>;
+          } catch {
+            return localJson({ error: "JSON 본문 형식이 올바르지 않습니다." }, 400);
+          }
+          const requestedRoot =
+            typeof body.root === "string" && body.root.trim()
+              ? body.root.trim()
+              : (options.config.roots[0] ?? process.cwd());
+          let safeRoot: string;
+          try {
+            safeRoot = resolveSafePath(
+              requestedRoot,
+              options.config.roots,
+              options.config.roots[0] ?? process.cwd(),
+              { configDir: options.configDir },
+            );
+          } catch (err) {
+            if (err instanceof SecurityError) {
+              return localJson({ error: err.message }, 403);
+            }
+            throw err;
+          }
+          if (!existsSync(safeRoot) || !statSync(safeRoot).isDirectory()) {
+            return localJson({ error: "작업 루트가 존재하는 디렉터리가 아닙니다." }, 400);
+          }
+
+          const userPrompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+          const denied = getSensitiveDeniedPaths(options.configDir);
+          const tree = collectWorkspaceTree(safeRoot, denied, 2, 120);
+
+          let gitStatusText = "";
+          let gitDiffText = "";
+          const gitBin = Bun.which("git");
+          if (gitBin) {
+            const stRes = await runGitCommandAsync(gitBin, ["status", "--short", "--branch"], safeRoot);
+            if (stRes.exitCode === 0) {
+              gitStatusText = stRes.stdout.trim();
+              const diffRes = await runGitCommandAsync(
+                gitBin,
+                ["diff", "--no-ext-diff", "--no-textconv"],
+                safeRoot,
+              );
+              if (diffRes.exitCode === 0) {
+                const rawDiff = diffRes.stdout.trim();
+                gitDiffText = rawDiff.length > 12_288 ? `${rawDiff.slice(0, 12_288)}\n... (truncated)` : rawDiff;
+              }
+            }
+          }
+
+          const sections: string[] = [
+            `[로컬 작업 폴더: ${safeRoot}]`,
+            "",
+            "### 프로젝트 파일 구조 (상위 2단계)",
+            "```text",
+            tree.length > 0 ? tree.join("\n") : "(빈 디렉터리)",
+            "```",
+          ];
+          if (gitStatusText) {
+            sections.push("", "### Git 상태", "```text", gitStatusText, "```");
+          }
+          if (gitDiffText) {
+            sections.push("", "### 현재 미커밋 Git Diff", "```diff", gitDiffText, "```");
+          }
+          sections.push(
+            "",
+            "### 요청 작업",
+            userPrompt || "위 프로젝트 구조와 변경사항을 분석하고 핵심 개선점 또는 다음 단계를 제안해줘.",
+          );
+
+          const rawComposed = sections.join("\n");
+          const composedPrompt = options.config.shieldSecrets ? maskSecrets(rawComposed).text : rawComposed;
+          return localJson({
+            ok: true,
+            root: safeRoot,
+            masked: Boolean(options.config.shieldSecrets),
+            composedPrompt,
+          });
         }
 
         if (pathname === "/_local/browser/reset-profile") {
@@ -712,7 +924,7 @@ export function startGeminationHttpServer(options: HttpServerOptions): Geminatio
         }
 
         if (pathname === "/_local/tunnel/open-tailscale") {
-          const opened = openTailscaleMacApp();
+          const opened = openTailscaleApp();
           return localJson({ ok: true, opened });
         }
 
