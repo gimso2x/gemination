@@ -1,0 +1,59 @@
+{
+  "name": "gemination",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Gemini Web -> Local PC official MCP connector with Studio GUI (Streamable HTTP + OAuth 2.1 + Tailscale Funnel / Cloudflare Tunnel)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/remorser58/gemination.git"
+  },
+  "homepage": "https://github.com/remorser58/gemination#readme",
+  "bugs": {
+    "url": "https://github.com/remorser58/gemination/issues"
+  },
+  "keywords": [
+    "mcp",
+    "gemini",
+    "oauth2",
+    "streamable-http",
+    "tailscale",
+    "cloudflare-tunnel",
+    "bun",
+    "local-agent"
+  ],
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "bin": {
+    "gemination": "./src/cli.ts"
+  },
+  "scripts": {
+    "gui": "bun run src/cli.ts gui",
+    "up": "bun run src/cli.ts up",
+    "setup": "bun run src/cli.ts setup",
+    "start": "bun run src/cli.ts serve",
+    "start:tailscale": "bun run src/cli.ts serve --tunnel tailscale",
+    "start:quick": "bun run src/cli.ts serve --tunnel quick",
+    "serve:local": "bun run src/cli.ts serve --tunnel none",
+    "config": "bun run src/cli.ts config",
+    "service:install": "bun run src/cli.ts service install",
+    "service:uninstall": "bun run src/cli.ts service uninstall",
+    "service:status": "bun run src/cli.ts service status",
+    "init": "bun run src/cli.ts init",
+    "doctor": "bun run src/cli.ts doctor",
+    "credentials": "bun run src/cli.ts credentials",
+    "revoke": "bun run src/cli.ts revoke",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test tests"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^5.9.3"
+  }
+}
