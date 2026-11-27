@@ -3,6 +3,7 @@ import {
   getGitNullHooksPath,
   getPlatformUiMeta,
   getTunnelInstallHint,
+  killProcessGracefully,
   resolveShellCommand,
 } from "../src/platform.ts";
 
@@ -42,5 +43,53 @@ describe("platform abstraction", () => {
     expect(win.folderPickerLabel).toContain("Windows");
     expect(lin.serviceTitle).toContain("systemd");
     expect(win.serviceTitle).toContain("Windows");
+  });
+
+  test("killProcessGracefully uses direct kill by default and terminates detached POSIX process groups when requested", async () => {
+    const signals: Array<string | number | undefined> = [];
+    killProcessGracefully({ pid: 999999, kill: (sig) => signals.push(sig) }, false, "linux");
+    killProcessGracefully({ pid: 999999, kill: (sig) => signals.push(sig) }, true, "linux", {
+      processGroup: false,
+    });
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+
+    if (process.platform !== "win32") {
+      const proc = Bun.spawn(
+        ["sh", "-c", "sleep 30 & echo $!; wait"],
+        { stdout: "pipe", stderr: "pipe", detached: true },
+      );
+      let grandchildPid = 0;
+      try {
+        const reader = proc.stdout.getReader();
+        const { value } = await reader.read();
+        reader.releaseLock();
+        grandchildPid = Number.parseInt(new TextDecoder().decode(value ?? new Uint8Array()).trim(), 10);
+        expect(grandchildPid).toBeGreaterThan(0);
+
+        killProcessGracefully(proc, true, process.platform, { processGroup: true });
+        await proc.exited;
+
+        let alive = true;
+        const deadline = Date.now() + 1500;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(grandchildPid, 0);
+            await Bun.sleep(25);
+          } catch {
+            alive = false;
+            break;
+          }
+        }
+        expect(alive).toBe(false);
+      } finally {
+        if (grandchildPid > 0) {
+          try {
+            process.kill(grandchildPid, "SIGKILL");
+          } catch {
+            // Already exited.
+          }
+        }
+      }
+    }
   });
 });
