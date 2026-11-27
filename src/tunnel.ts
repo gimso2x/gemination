@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getTunnelInstallHint, killProcessGracefully } from "./platform.ts";
 import type { TailscaleFunnelPort } from "./types.ts";
@@ -10,6 +11,7 @@ export interface TunnelHandle {
 }
 
 export interface QuickTunnelOptions {
+  binary?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -76,18 +78,40 @@ export async function startCloudflaredQuickTunnel(
     throw new Error("Tunnel startup aborted");
   }
 
-  const binary = findCloudflaredBinary();
+  const binary = opts.binary ?? findCloudflaredBinary();
   if (!binary) {
     throw new Error(
       `cloudflared 실행 파일을 찾을 수 없습니다. \`${getTunnelInstallHint("cloudflared")}\`로 설치하거나 Tailscale Funnel / \`--tunnel none --public-url <url>\`을 선택하세요.`,
     );
   }
 
-  const proc = Bun.spawn([binary, "tunnel", "--url", localUrl, "--no-autoupdate"], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: process.env,
-  });
+  // Isolate quick tunnels from host cloudflared config.yml ingress rules (e.g. catch-all 404).
+  const tempConfigDir = mkdtempSync(join(tmpdir(), "gemination-cloudflared-"));
+  const emptyConfigPath = join(tempConfigDir, "config.yml");
+  writeFileSync(emptyConfigPath, "{}\n", { encoding: "utf8", mode: 0o600 });
+
+  let cleaned = false;
+  const cleanupTempConfig = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      rmSync(tempConfigDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup of temporary empty config directory.
+    }
+  };
+
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn([binary, "tunnel", "--config", emptyConfigPath, "--url", localUrl, "--no-autoupdate"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: process.env,
+    });
+  } catch (err) {
+    cleanupTempConfig();
+    throw err;
+  }
 
   const logs: string[] = [];
   let settled = false;
@@ -101,6 +125,7 @@ export async function startCloudflaredQuickTunnel(
       await proc.exited;
     } finally {
       clearTimeout(deadline);
+      cleanupTempConfig();
     }
   };
 
@@ -149,6 +174,7 @@ export async function startCloudflaredQuickTunnel(
     void collectProcessStream(proc.stdout, handleLine);
     void collectProcessStream(proc.stderr, handleLine);
     void proc.exited.then((code) => {
+      cleanupTempConfig();
       if (!settled) {
         settled = true;
         clearTimeout(timer);
