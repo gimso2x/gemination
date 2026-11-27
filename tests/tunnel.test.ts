@@ -32,7 +32,12 @@ function makeTempScript(filename: string, jsBody: string): string {
 
 afterEach(() => {
   while (tempDirs.length > 0) {
-    rmSync(tempDirs.pop()!, { recursive: true, force: true });
+    const dir = tempDirs.pop()!;
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Ignore transient Windows binary lock immediately after process kill.
+    }
   }
 });
 

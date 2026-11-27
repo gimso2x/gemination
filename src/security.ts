@@ -9,7 +9,7 @@ import {
   type Stats,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, win32 } from "node:path";
+import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 import { ensureDirSecure, expandTilde } from "./config.ts";
 import { maskSecrets } from "./secrets-shield.ts";
 import type { AuditEntry } from "./types.ts";
@@ -67,7 +67,7 @@ export function isPathInside(
   targetPlatform: string = process.platform,
   caseInsensitive: boolean = targetPlatform === "win32",
 ): boolean {
-  const pathImpl = targetPlatform === "win32" ? win32 : { resolve, sep: "/" };
+  const pathImpl = targetPlatform === "win32" ? win32 : posix;
   let normCandidate = pathImpl.resolve(candidate);
   let normParent = pathImpl.resolve(parent);
   if (caseInsensitive) {
@@ -281,77 +281,66 @@ const CATASTROPHIC_COMMAND_PATTERNS: Array<{ pattern: RegExp; reason: string }> 
 ];
 
 const POWER_COMMANDS = new Set(["shutdown", "shutdown.exe", "reboot", "halt", "poweroff"]);
-const SHELL_PREFIX_KEYWORDS = new Set(["then", "do", "else", "elif", "!"]);
+const SHELL_PREFIX_KEYWORDS = new Set([
+  "if",
+  "then",
+  "else",
+  "elif",
+  "while",
+  "until",
+  "do",
+  "coproc",
+  "builtin",
+  "!",
+  "{",
+  "}",
+]);
 const COMMAND_WRAPPERS = new Set(["sudo", "doas", "env", "exec", "command", "nohup", "time"]);
 const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const REDIR_PREFIX_RE = /^(?:\d*[<>]+.*|&[<>].*)$/;
+const WRAPPER_VALUE_FLAGS: Record<string, ReadonlySet<string>> = {
+  sudo: new Set(["-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-R", "--chroot", "-D", "--chdir"]),
+  doas: new Set(["-u", "-C"]),
+  env: new Set(["-u", "--unset", "-C", "--chdir", "-a", "--argv0"]),
+  exec: new Set(["-a"]),
+};
+const SUDO_SHORT_VALUE_CHARS = new Set(["u", "g", "C", "h", "p", "r", "t", "T", "U", "R", "D"]);
 
-function consumeBacktick(
+function collectRawSegments(
   input: string,
   start: number,
-  insideDoubleQuote: boolean,
-): { out: string; nextIndex: number } {
-  const raw: string[] = [];
-  let i = start;
-  while (i < input.length) {
-    const ch = input[i]!;
-    if (ch === "\\") {
-      const next = input[i + 1];
-      if (next === undefined) {
-        i += 1;
-        break;
-      }
-      if (next === "`" || next === "\\" || next === "$" || (insideDoubleQuote && next === '"')) {
-        raw.push(next);
-      } else {
-        raw.push("\\", next);
-      }
-      i += 2;
-      continue;
-    }
-    if (ch === "`") {
-      i += 1;
-      break;
-    }
-    raw.push(ch);
-    i += 1;
-  }
-  return { out: stripNonExecutableQuotes(raw.join("")), nextIndex: i };
-}
-
-function consumeQuoted(
-  input: string,
-  start: number,
-  stopAtMatchingParen = false,
-): { out: string; nextIndex: number } {
-  const chunks: string[] = [];
+  stopAtParen: boolean,
+  segments: string[],
+): number {
+  let buf = "";
   let i = start;
   let parenDepth = 0;
 
   while (i < input.length) {
     const ch = input[i]!;
-
-    if (stopAtMatchingParen) {
+    if (stopAtParen) {
       if (ch === "(") {
         parenDepth += 1;
-        chunks.push(ch);
+        buf += ch;
         i += 1;
         continue;
       }
       if (ch === ")") {
         if (parenDepth === 0) {
-          return { out: chunks.join(""), nextIndex: i + 1 };
+          if (buf.trim()) segments.push(buf);
+          return i + 1;
         }
         parenDepth -= 1;
-        chunks.push(ch);
+        buf += ch;
         i += 1;
         continue;
       }
     }
 
     if (ch === "\\") {
-      chunks.push(ch);
+      buf += ch;
       if (i + 1 < input.length) {
-        chunks.push(input[i + 1]!);
+        buf += input[i + 1]!;
         i += 2;
       } else {
         i += 1;
@@ -360,85 +349,276 @@ function consumeQuoted(
     }
 
     if (ch === "'") {
-      chunks.push(" ");
+      const ansiC = i > 0 && input[i - 1] === "$";
+      buf += ch;
       i += 1;
       while (i < input.length && input[i] !== "'") {
+        if (ansiC && input[i] === "\\" && i + 1 < input.length) {
+          buf += input[i]! + input[i + 1]!;
+          i += 2;
+          continue;
+        }
+        buf += input[i]!;
         i += 1;
       }
       if (i < input.length && input[i] === "'") {
+        buf += "'";
         i += 1;
       }
-      chunks.push(" ");
       continue;
     }
 
     if (ch === '"') {
-      chunks.push(" ");
+      buf += ch;
       i += 1;
       while (i < input.length && input[i] !== '"') {
         const inner = input[i]!;
         if (inner === "\\") {
+          buf += inner + (i + 1 < input.length ? input[i + 1]! : "");
           i += i + 1 < input.length ? 2 : 1;
-          chunks.push(" ");
           continue;
         }
         if (inner === "$" && input[i + 1] === "(") {
-          const subst = consumeQuoted(input, i + 2, true);
-          chunks.push(" ; ", subst.out, " ; ");
-          i = subst.nextIndex;
+          i = collectRawSegments(input, i + 2, true, segments);
+          buf += " ";
           continue;
         }
         if (inner === "`") {
-          const bt = consumeBacktick(input, i + 1, true);
-          chunks.push(" ; ", bt.out, " ; ");
-          i = bt.nextIndex;
+          let bt = "";
+          i += 1;
+          while (i < input.length && input[i] !== "`") {
+            if (input[i] === "\\" && i + 1 < input.length) {
+              const next = input[i + 1]!;
+              bt += next === "`" || next === "\\" || next === "$" || next === '"' ? next : `\\${next}`;
+              i += 2;
+              continue;
+            }
+            bt += input[i]!;
+            i += 1;
+          }
+          if (i < input.length && input[i] === "`") i += 1;
+          collectRawSegments(bt, 0, false, segments);
+          buf += " ";
           continue;
         }
-        chunks.push(" ");
+        buf += inner;
         i += 1;
       }
       if (i < input.length && input[i] === '"') {
+        buf += '"';
         i += 1;
       }
-      chunks.push(" ");
       continue;
     }
 
     if (ch === "`") {
-      const bt = consumeBacktick(input, i + 1, false);
-      chunks.push(" ; ", bt.out, " ; ");
-      i = bt.nextIndex;
+      let bt = "";
+      i += 1;
+      while (i < input.length && input[i] !== "`") {
+        if (input[i] === "\\" && i + 1 < input.length) {
+          const next = input[i + 1]!;
+          bt += next === "`" || next === "\\" || next === "$" ? next : `\\${next}`;
+          i += 2;
+          continue;
+        }
+        bt += input[i]!;
+        i += 1;
+      }
+      if (i < input.length && input[i] === "`") i += 1;
+      collectRawSegments(bt, 0, false, segments);
+      if (buf.trim()) segments.push(buf);
+      buf = "";
       continue;
     }
 
-    chunks.push(ch);
+    if (ch === ";" || ch === "&" || ch === "|" || ch === "\n" || ch === "(" || ch === ")" || ch === "{" || ch === "}") {
+      if (buf.trim()) segments.push(buf);
+      buf = "";
+      i += 1;
+      continue;
+    }
+
+    buf += ch;
     i += 1;
   }
 
-  return { out: chunks.join(""), nextIndex: i };
+  if (buf.trim()) segments.push(buf);
+  return i;
 }
 
-function stripNonExecutableQuotes(command: string): string {
-  return consumeQuoted(command, 0, false).out;
+function splitSegmentTokens(segment: string): string[] {
+  const tokens: string[] = [];
+  let cur = "";
+  let i = 0;
+  while (i < segment.length) {
+    const ch = segment[i]!;
+    if (/\s/.test(ch)) {
+      if (cur) {
+        tokens.push(cur);
+        cur = "";
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "\\") {
+      cur += ch + (i + 1 < segment.length ? segment[i + 1]! : "");
+      i += i + 1 < segment.length ? 2 : 1;
+      continue;
+    }
+    if (ch === "'") {
+      const ansiC = i > 0 && segment[i - 1] === "$";
+      cur += ch;
+      i += 1;
+      while (i < segment.length && segment[i] !== "'") {
+        if (ansiC && segment[i] === "\\" && i + 1 < segment.length) {
+          cur += segment[i]! + segment[i + 1]!;
+          i += 2;
+          continue;
+        }
+        cur += segment[i]!;
+        i += 1;
+      }
+      if (i < segment.length && segment[i] === "'") {
+        cur += "'";
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      cur += ch;
+      i += 1;
+      while (i < segment.length && segment[i] !== '"') {
+        if (segment[i] === "\\" && i + 1 < segment.length) {
+          cur += segment[i]! + segment[i + 1]!;
+          i += 2;
+          continue;
+        }
+        cur += segment[i]!;
+        i += 1;
+      }
+      if (i < segment.length && segment[i] === '"') {
+        cur += '"';
+        i += 1;
+      }
+      continue;
+    }
+    cur += ch;
+    i += 1;
+  }
+  if (cur) tokens.push(cur);
+  return tokens;
+}
+
+function unquoteCommandWord(token: string): string {
+  const looksLikeWinPath = /^["']?[A-Za-z]:[/\\]|^["']?\\\\/.test(token);
+  let out = "";
+  let i = 0;
+  while (i < token.length) {
+    const ch = token[i]!;
+    if (ch === "$" && token[i + 1] === "'") {
+      i += 2;
+      while (i < token.length && token[i] !== "'") {
+        if (token[i] === "\\" && i + 1 < token.length) {
+          out += token[i + 1]!;
+          i += 2;
+        } else {
+          out += token[i]!;
+          i += 1;
+        }
+      }
+      if (i < token.length && token[i] === "'") i += 1;
+      continue;
+    }
+    if (ch === "'") {
+      i += 1;
+      while (i < token.length && token[i] !== "'") {
+        out += token[i]!;
+        i += 1;
+      }
+      if (i < token.length && token[i] === "'") i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      i += 1;
+      while (i < token.length && token[i] !== '"') {
+        if (!looksLikeWinPath && token[i] === "\\" && i + 1 < token.length) {
+          out += token[i + 1]!;
+          i += 2;
+        } else {
+          out += token[i]!;
+          i += 1;
+        }
+      }
+      if (i < token.length && token[i] === '"') i += 1;
+      continue;
+    }
+    if (!looksLikeWinPath && ch === "\\" && i + 1 < token.length) {
+      out += token[i + 1]!;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
 }
 
 function findFirstExecutableToken(segment: string): string | null {
-  const tokens = segment.trim().split(/\s+/).filter(Boolean);
-  let afterWrapper = false;
-  for (const token of tokens) {
+  const tokens = splitSegmentTokens(segment);
+  let activeWrapper: string | null = null;
+  let skipNextToken = false;
+  let skipNextRedirTarget = false;
+
+  for (const rawToken of tokens) {
+    if (skipNextRedirTarget) {
+      skipNextRedirTarget = false;
+      continue;
+    }
+    if (skipNextToken) {
+      skipNextToken = false;
+      continue;
+    }
+    if (rawToken === "<" || rawToken === ">" || rawToken === ">>") {
+      skipNextRedirTarget = true;
+      continue;
+    }
+    if (REDIR_PREFIX_RE.test(rawToken)) {
+      if (/^\d*[<>]+$/.test(rawToken)) {
+        skipNextRedirTarget = true;
+      }
+      continue;
+    }
+
+    const token = unquoteCommandWord(rawToken);
+    if (!token) continue;
+
     if (SHELL_PREFIX_KEYWORDS.has(token)) {
-      afterWrapper = false;
+      activeWrapper = null;
       continue;
     }
     if (ENV_ASSIGNMENT_RE.test(token)) {
       continue;
     }
-    if (afterWrapper && token.startsWith("-")) {
+    if (activeWrapper && token.startsWith("-")) {
+      if (activeWrapper === "command" && (token === "-v" || token === "-V")) {
+        return null;
+      }
+      const valueFlags = WRAPPER_VALUE_FLAGS[activeWrapper];
+      if (valueFlags && valueFlags.has(token)) {
+        skipNextToken = true;
+      } else if (
+        activeWrapper === "sudo"
+        && /^-[A-Za-z]+$/.test(token)
+        && SUDO_SHORT_VALUE_CHARS.has(token[token.length - 1]!)
+      ) {
+        skipNextToken = true;
+      }
       continue;
     }
+
     const base = token.replace(/^.*[/\\]/, "").toLowerCase();
     if (COMMAND_WRAPPERS.has(base)) {
-      afterWrapper = true;
+      activeWrapper = base;
       continue;
     }
     return base;
@@ -447,8 +627,9 @@ function findFirstExecutableToken(segment: string): string | null {
 }
 
 function hasDangerousPowerCommand(command: string): boolean {
-  const stripped = stripNonExecutableQuotes(command);
-  for (const segment of stripped.split(/[;&|\n()`]+/)) {
+  const segments: string[] = [];
+  collectRawSegments(command, 0, false, segments);
+  for (const segment of segments) {
     const cmd = findFirstExecutableToken(segment);
     if (cmd && POWER_COMMANDS.has(cmd)) {
       return true;
@@ -465,7 +646,7 @@ export function checkCommandSafety(command: string): void {
   if (trimmed.includes("\0")) {
     throw new SecurityError("Command contains NUL byte");
   }
-  const flattened = trimmed.replace(/[\\`]\r?\n/g, " ");
+  const flattened = trimmed.replace(/\\\r?\n/g, "").replace(/`\r?\n/g, " ");
   for (const rule of CATASTROPHIC_COMMAND_PATTERNS) {
     if (rule.pattern.test(trimmed) || rule.pattern.test(flattened)) {
       throw new SecurityError(`Blocked dangerous command: ${rule.reason}`);

@@ -48,6 +48,7 @@ StdioServerTransport (`src/cli.ts`)
    - Allowed redirect hosts by default:
      - `https://oauth-redirect.googleusercontent.com/*`
      - `https://oauth-redirect-sandbox.googleusercontent.com/*`
+     - `https://oauth-redirect-test.googleusercontent.com/*`
      - `https://vertexaisearch.cloud.google.com/*`
      - `http://127.0.0.1:*/*` and `http://localhost:*/*`
      - Custom hosts explicitly configured via `extraRedirectHosts` in `config.json`.

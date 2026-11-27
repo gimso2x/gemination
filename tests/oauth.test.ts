@@ -9,6 +9,7 @@ import { OAuthServer } from "../src/oauth.ts";
 let configDir: string;
 let oauth: OAuthServer;
 let prevPinEnv: string | undefined;
+const extraTempDirs: string[] = [];
 const BASE_URL = "https://gemination-test.trycloudflare.com";
 const TEST_PIN = "2345-ABCD-EFGH";
 
@@ -29,6 +30,9 @@ afterEach(() => {
   if (prevPinEnv === undefined) delete process.env.GEMINATION_PIN;
   else process.env.GEMINATION_PIN = prevPinEnv;
   rmSync(configDir, { recursive: true, force: true });
+  while (extraTempDirs.length > 0) {
+    rmSync(extraTempDirs.pop()!, { recursive: true, force: true });
+  }
 });
 
 describe("OAuthServer metadata and registration", () => {
@@ -128,7 +132,9 @@ describe("OAuthServer metadata and registration", () => {
     delete process.env.GEMINATION_PIN;
     const cfg = defaultConfig();
     cfg.roots = [configDir];
-    const localOauth = new OAuthServer(mkdtempSync(join(tmpdir(), "gemination-pin-test-")), cfg);
+    const pinTestDir = mkdtempSync(join(tmpdir(), "gemination-pin-test-"));
+    extraTempDirs.push(pinTestDir);
+    const localOauth = new OAuthServer(pinTestDir, cfg);
     const issuedPin = localOauth.resetPin();
 
     const redirectUri = "https://oauth-redirect.googleusercontent.com/r/pin-test";

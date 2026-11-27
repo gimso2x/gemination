@@ -90,6 +90,47 @@ describe("platform abstraction", () => {
           }
         }
       }
+    } else {
+      const proc = Bun.spawn(
+        [
+          process.execPath,
+          "-e",
+          `const c = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "ignore" }); console.log(c.pid); setInterval(() => {}, 1000);`,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      let grandchildPid = 0;
+      try {
+        const reader = proc.stdout.getReader();
+        const { value } = await reader.read();
+        reader.releaseLock();
+        grandchildPid = Number.parseInt(new TextDecoder().decode(value ?? new Uint8Array()).trim(), 10);
+        expect(grandchildPid).toBeGreaterThan(0);
+
+        killProcessGracefully(proc, true, "win32");
+        await proc.exited;
+
+        let alive = true;
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(grandchildPid, 0);
+            await Bun.sleep(25);
+          } catch {
+            alive = false;
+            break;
+          }
+        }
+        expect(alive).toBe(false);
+      } finally {
+        if (grandchildPid > 0) {
+          try {
+            process.kill(grandchildPid);
+          } catch {
+            // Already exited.
+          }
+        }
+      }
     }
   });
 });

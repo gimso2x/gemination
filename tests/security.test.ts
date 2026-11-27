@@ -79,7 +79,7 @@ describe("resolveSafePath", () => {
     ).toThrow(SecurityError);
 
     const danglingDirLink = join(workspaceDir, "dangling-dir");
-    symlinkSync(join(outsideDir, "nonexistent-dir"), danglingDirLink);
+    symlinkSync(join(outsideDir, "nonexistent-dir"), danglingDirLink, "dir");
     expect(() =>
       resolveSafePath("dangling-dir/nested/pwn.txt", [workspaceDir], workspaceDir, {
         allowMissingLeaf: true,
@@ -115,6 +115,7 @@ describe("checkCommandSafety", () => {
     expect(() => checkCommandSafety("grep -n poweroff src/app.ts")).not.toThrow();
     expect(() => checkCommandSafety('echo "halt and catch fire"')).not.toThrow();
     expect(() => checkCommandSafety("bun run shutdown-helper.ts")).not.toThrow();
+    expect(() => checkCommandSafety("command -v reboot")).not.toThrow();
   });
 
   test("blocks catastrophic commands", () => {
@@ -126,8 +127,22 @@ describe("checkCommandSafety", () => {
     expect(() => checkCommandSafety("dd if=/dev/zero of=/dev/disk0")).toThrow(SecurityError);
     expect(() => checkCommandSafety("shutdown -h now")).toThrow(SecurityError);
     expect(() => checkCommandSafety("/sbin/shutdown -h now")).toThrow(SecurityError);
+    expect(() => checkCommandSafety('"shutdown" -h now')).toThrow(SecurityError);
+    expect(() => checkCommandSafety("'reboot'")).toThrow(SecurityError);
+    expect(() => checkCommandSafety('shut""down -h now')).toThrow(SecurityError);
+    expect(() => checkCommandSafety("re\\boot")).toThrow(SecurityError);
     expect(() => checkCommandSafety("sudo shutdown -h now")).toThrow(SecurityError);
+    expect(() => checkCommandSafety('sudo "reboot"')).toThrow(SecurityError);
     expect(() => checkCommandSafety("sudo -n /usr/sbin/reboot")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("sudo -u root shutdown -h now")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("sudo -nu root reboot")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("env -u PATH reboot")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("env -S reboot")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("exec -a fake reboot")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("$'\\''; reboot")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("{ shutdown -h now; }")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("if reboot; then :; fi")).toThrow(SecurityError);
+    expect(() => checkCommandSafety(">/dev/null reboot")).toThrow(SecurityError);
     expect(() => checkCommandSafety("FOO=1 poweroff")).toThrow(SecurityError);
     expect(() => checkCommandSafety("echo ok && halt")).toThrow(SecurityError);
     expect(() => checkCommandSafety("if true; then shutdown -h now; fi")).toThrow(SecurityError);
@@ -145,6 +160,7 @@ describe("checkCommandSafety", () => {
     expect(isPathInside("c:\\users\\alice\\Project\\sub\\file.ts", "C:\\Users\\Alice\\project", "win32")).toBe(true);
     expect(isPathInside("C:\\Users\\Alice\\project-other\\file.ts", "C:\\Users\\Alice\\project", "win32")).toBe(false);
     expect(isPathInside("/Users/alice/project", "/Users/alice/project", "darwin")).toBe(true);
+    expect(isPathInside("/Users/alice/project/sub/file.ts", "/Users/alice/project", "darwin")).toBe(true);
     expect(isPathInside("/Users/alice/project-other", "/Users/alice/project", "darwin")).toBe(false);
 
     if (process.platform === "darwin" || process.platform === "win32") {

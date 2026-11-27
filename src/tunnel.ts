@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getTunnelInstallHint, killProcessGracefully } from "./platform.ts";
+import { buildSanitizedChildEnv } from "./security.ts";
 import type { TailscaleFunnelPort } from "./types.ts";
 
 export interface TunnelHandle {
@@ -88,7 +89,6 @@ export async function startCloudflaredQuickTunnel(
   // Isolate quick tunnels from host cloudflared config.yml ingress rules (e.g. catch-all 404).
   const tempConfigDir = mkdtempSync(join(tmpdir(), "gemination-cloudflared-"));
   const emptyConfigPath = join(tempConfigDir, "config.yml");
-  writeFileSync(emptyConfigPath, "{}\n", { encoding: "utf8", mode: 0o600 });
 
   let cleaned = false;
   const cleanupTempConfig = (): void => {
@@ -103,10 +103,11 @@ export async function startCloudflaredQuickTunnel(
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {
+    writeFileSync(emptyConfigPath, "{}\n", { encoding: "utf8", mode: 0o600 });
     proc = Bun.spawn([binary, "tunnel", "--config", emptyConfigPath, "--url", localUrl, "--no-autoupdate"], {
       stdout: "pipe",
       stderr: "pipe",
-      env: process.env,
+      env: buildSanitizedChildEnv(),
     });
   } catch (err) {
     cleanupTempConfig();
@@ -432,7 +433,7 @@ export async function inspectTailscaleStatusAsync(
   const proc = Bun.spawn([binary, "status", "--json"], {
     stdout: "pipe",
     stderr: "pipe",
-    env: process.env,
+    env: buildSanitizedChildEnv(),
   });
   const timer = setTimeout(() => {
     try {
@@ -515,7 +516,7 @@ export async function startTailscaleFunnel(
   const proc = Bun.spawn([binary, "funnel", `--https=${httpsPort}`, localUrl], {
     stdout: "pipe",
     stderr: "pipe",
-    env: process.env,
+    env: buildSanitizedChildEnv(),
   });
 
   const logs: string[] = [];

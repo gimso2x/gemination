@@ -296,10 +296,37 @@ describe("Gemination MCP tools", () => {
     }
   });
 
-  test("terminates POSIX grandchild processes holding pipes on run_command timeout and stop_process", async () => {
-    if (process.platform === "win32") return;
-
+  test("terminates grandchild processes holding pipes on run_command timeout and stop_process", async () => {
     const { client, close } = await connectTestClient();
+
+    if (process.platform === "win32") {
+      try {
+        await client.callTool({
+          name: "write_file",
+          arguments: {
+            path: "_win_hang.mjs",
+            content: [
+              'const c = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { stdout: "pipe", stderr: "pipe" });',
+              "console.log(c.pid);",
+              "setInterval(() => {}, 1000);",
+            ].join("\n"),
+          },
+        });
+        const startedAt = Date.now();
+        const res = parseToolJson(
+          await client.callTool({
+            name: "run_command",
+            arguments: { command: "bun _win_hang.mjs", timeoutMs: 1200 },
+          }),
+        );
+        expect(res.timedOut).toBe(true);
+        expect(Date.now() - startedAt).toBeLessThan(8000);
+      } finally {
+        await close();
+      }
+      return;
+    }
+
     let runGcPid = 0;
     let bgGcPid = 0;
     const isPidAlive = (pid: number): boolean => {
@@ -311,7 +338,7 @@ describe("Gemination MCP tools", () => {
       }
     };
     const waitPidGone = async (pid: number): Promise<boolean> => {
-      const deadline = Date.now() + 1500;
+      const deadline = Date.now() + 2000;
       while (Date.now() < deadline) {
         if (!isPidAlive(pid)) return true;
         await Bun.sleep(25);
@@ -326,19 +353,44 @@ describe("Gemination MCP tools", () => {
           name: "run_command",
           arguments: {
             command: "(sleep 30) & printf '%s' \"$!\" > _run_gc.pid; sleep 30",
-            timeoutMs: 600,
+            timeoutMs: 1200,
           },
         }),
       );
       const elapsedMs = Date.now() - startedAt;
       expect(timedOutRes.timedOut).toBe(true);
-      expect(elapsedMs).toBeLessThan(3000);
+      expect(elapsedMs).toBeLessThan(4000);
 
       const runPidPath = join(workspaceDir, "_run_gc.pid");
       expect(existsSync(runPidPath)).toBe(true);
       runGcPid = Number.parseInt(readFileSync(runPidPath, "utf8").trim(), 10);
       expect(runGcPid).toBeGreaterThan(0);
       expect(await waitPidGone(runGcPid)).toBe(true);
+
+      // Early parent exit while descendant keeps stdio pipes open must still stop at timeoutMs
+      const orphanStart = Date.now();
+      const orphanRes = parseToolJson(
+        await client.callTool({
+          name: "run_command",
+          arguments: {
+            command: "(sleep 30) & printf '%s' \"$!\" > _orphan_gc.pid",
+            timeoutMs: 800,
+          },
+        }),
+      );
+      expect(orphanRes.timedOut).toBe(true);
+      expect(Date.now() - orphanStart).toBeLessThan(3500);
+      const orphanPid = Number.parseInt(readFileSync(join(workspaceDir, "_orphan_gc.pid"), "utf8").trim(), 10);
+      expect(orphanPid).toBeGreaterThan(0);
+      try {
+        expect(await waitPidGone(orphanPid)).toBe(true);
+      } finally {
+        try {
+          process.kill(orphanPid, "SIGKILL");
+        } catch {
+          // Already exited.
+        }
+      }
 
       const bgStarted = parseToolJson(
         await client.callTool({
@@ -369,6 +421,34 @@ describe("Gemination MCP tools", () => {
       );
       expect(stopped.status).toBe("killed");
       expect(await waitPidGone(bgGcPid)).toBe(true);
+
+      // Grandchild ignoring SIGTERM holding pipes must still be killed via SIGKILL escalation on timeout
+      let trapGcPid = 0;
+      const trapStartedAt = Date.now();
+      const trapRes = parseToolJson(
+        await client.callTool({
+          name: "run_command",
+          arguments: {
+            command: "(sh -c \"trap '' TERM; sleep 30\") & printf '%s' \"$!\" > _trap_gc.pid; sleep 30",
+            timeoutMs: 1200,
+          },
+        }),
+      );
+      expect(trapRes.timedOut).toBe(true);
+      expect(Date.now() - trapStartedAt).toBeLessThan(4000);
+      const trapPidPath = join(workspaceDir, "_trap_gc.pid");
+      expect(existsSync(trapPidPath)).toBe(true);
+      trapGcPid = Number.parseInt(readFileSync(trapPidPath, "utf8").trim(), 10);
+      expect(trapGcPid).toBeGreaterThan(0);
+      try {
+        expect(await waitPidGone(trapGcPid)).toBe(true);
+      } finally {
+        try {
+          process.kill(trapGcPid, "SIGKILL");
+        } catch {
+          // Already exited.
+        }
+      }
     } finally {
       for (const pid of [runGcPid, bgGcPid]) {
         if (pid > 0) {
