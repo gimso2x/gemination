@@ -128,11 +128,22 @@ function truncateUtf8(bytes: Uint8Array, maxBytes: number): { text: string; trun
 async function readStreamCapped(
   stream: ReadableStream<Uint8Array> | number | null | undefined,
   capBytes: number,
+  signal?: AbortSignal,
 ): Promise<{ text: string; truncated: boolean; totalBytes: number }> {
   if (!stream || typeof stream === "number") {
     return { text: "", truncated: false, totalBytes: 0 };
   }
   const reader = stream.getReader();
+  const onAbort = () => {
+    void reader.cancel().catch(() => {});
+  };
+  if (signal) {
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
   const chunks: Uint8Array[] = [];
   let collected = 0;
   let totalBytes = 0;
@@ -157,7 +168,10 @@ async function readStreamCapped(
         truncated = true;
       }
     }
+  } catch {
+    // Stream cancelled or errored after timeout drain grace.
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
   const merged = new Uint8Array(collected);
@@ -171,6 +185,75 @@ async function readStreamCapped(
     truncated,
     totalBytes,
   };
+}
+
+async function runBoundedSubprocess(
+  argv: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+  maxOutputBytes: number,
+): Promise<{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  timedOut: boolean;
+  durationMs: number;
+}> {
+  const started = Date.now();
+  const useProcessGroup = process.platform !== "win32";
+  const proc = Bun.spawn(argv, {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    env,
+    detached: useProcessGroup,
+  });
+
+  const streamAbort = new AbortController();
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    killProcessGracefully(proc, false, process.platform, { processGroup: useProcessGroup });
+    killTimer = setTimeout(() => {
+      killProcessGracefully(proc, true, process.platform, { processGroup: useProcessGroup });
+    }, 1500);
+  }, timeoutMs);
+
+  const exitedPromise = proc.exited.then((code) => {
+    if (timedOut) {
+      // Stop waiting on leaked stdout/stderr FDs if a grandchild escaped the process group.
+      drainTimer = setTimeout(() => {
+        streamAbort.abort();
+      }, 250);
+    }
+    return code;
+  });
+
+  try {
+    const [stdoutRes, stderrRes, exitCode] = await Promise.all([
+      readStreamCapped(proc.stdout, maxOutputBytes, streamAbort.signal),
+      readStreamCapped(proc.stderr, maxOutputBytes, streamAbort.signal),
+      exitedPromise,
+    ]);
+    return {
+      exitCode,
+      stdout: stdoutRes.text,
+      stderr: stderrRes.text,
+      stdoutTruncated: stdoutRes.truncated,
+      stderrTruncated: stderrRes.truncated,
+      timedOut,
+      durationMs: Date.now() - started,
+    };
+  } finally {
+    clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
+    if (drainTimer) clearTimeout(drainTimer);
+  }
 }
 
 async function runSimpleShell(
@@ -187,43 +270,13 @@ async function runSimpleShell(
   timedOut: boolean;
   durationMs: number;
 }> {
-  const started = Date.now();
-  const proc = Bun.spawn(resolveShellCommand(command), {
+  return runBoundedSubprocess(
+    resolveShellCommand(command),
     cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: buildSanitizedChildEnv(),
-  });
-
-  let timedOut = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    killProcessGracefully(proc, false);
-    killTimer = setTimeout(() => {
-      killProcessGracefully(proc, true);
-    }, 1500);
-  }, timeoutMs);
-
-  try {
-    const [stdoutRes, stderrRes, exitCode] = await Promise.all([
-      readStreamCapped(proc.stdout, maxOutputBytes),
-      readStreamCapped(proc.stderr, maxOutputBytes),
-      proc.exited,
-    ]);
-    return {
-      exitCode,
-      stdout: stdoutRes.text,
-      stderr: stderrRes.text,
-      stdoutTruncated: stdoutRes.truncated,
-      stderrTruncated: stderrRes.truncated,
-      timedOut,
-      durationMs: Date.now() - started,
-    };
-  } finally {
-    clearTimeout(timer);
-    if (killTimer) clearTimeout(killTimer);
-  }
+    buildSanitizedChildEnv(),
+    timeoutMs,
+    maxOutputBytes,
+  );
 }
 
 async function runArgv(
@@ -232,32 +285,19 @@ async function runArgv(
   timeoutMs: number,
   maxOutputBytes: number,
 ): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean }> {
-  const proc = Bun.spawn(argv, {
+  const res = await runBoundedSubprocess(
+    argv,
     cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...buildSanitizedChildEnv(), GIT_TERMINAL_PROMPT: "0" },
-  });
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    killProcessGracefully(proc, false);
-  }, timeoutMs);
-  try {
-    const [stdoutRes, stderrRes, exitCode] = await Promise.all([
-      readStreamCapped(proc.stdout, maxOutputBytes),
-      readStreamCapped(proc.stderr, maxOutputBytes),
-      proc.exited,
-    ]);
-    return {
-      exitCode,
-      stdout: stdoutRes.text,
-      stderr: stderrRes.text,
-      timedOut,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
+    { ...buildSanitizedChildEnv(), GIT_TERMINAL_PROMPT: "0" },
+    timeoutMs,
+    maxOutputBytes,
+  );
+  return {
+    exitCode: res.exitCode,
+    stdout: res.stdout,
+    stderr: res.stderr,
+    timedOut: res.timedOut,
+  };
 }
 
 function globToRegex(glob: string): RegExp {

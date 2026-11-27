@@ -404,3 +404,161 @@ describe("OAuthServer authorization, PKCE, RFC 8707, and revocation", () => {
     expect(postTokenRes.status).toBe(200);
   });
 });
+
+describe("OAuthServer DCR active session protection", () => {
+  const redirectUri = "https://oauth-redirect.googleusercontent.com/r/dcr-protection";
+  const verifier = "verifier_abcdefghijklmnopqrstuvwxyz_0123456789";
+
+  async function registerClient(server: OAuthServer, name: string): Promise<string> {
+    const res = await server.handleRegister(
+      new Request(`${BASE_URL}/oauth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_name: name, redirect_uris: [redirectUri] }),
+      }),
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { client_id: string };
+    return body.client_id;
+  }
+
+  async function authorizeClient(server: OAuthServer, clientId: string): Promise<string> {
+    const res = await server.handleAuthorizePost(
+      new Request(`${BASE_URL}/oauth/authorize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          response_type: "code",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: pkceChallenge(verifier),
+          code_challenge_method: "S256",
+          resource: `${BASE_URL}/mcp`,
+          pin: TEST_PIN,
+          decision: "approve",
+        }).toString(),
+      }),
+      BASE_URL,
+    );
+    expect(res.status).toBe(302);
+    return new URL(res.headers.get("location")!).searchParams.get("code")!;
+  }
+
+  async function exchangeCode(
+    server: OAuthServer,
+    clientId: string,
+    code: string,
+  ): Promise<{ access_token: string; refresh_token: string }> {
+    const res = await server.handleToken(
+      new Request(`${BASE_URL}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+          code_verifier: verifier,
+          resource: `${BASE_URL}/mcp`,
+        }).toString(),
+      }),
+      BASE_URL,
+    );
+    expect(res.status).toBe(200);
+    return (await res.json()) as { access_token: string; refresh_token: string };
+  }
+
+  test("preserves dynamic client with active tokens across >=64 subsequent DCR registrations and refresh", async () => {
+    const activeClientId = await registerClient(oauth, "Owner Gemini");
+    const code = await authorizeClient(oauth, activeClientId);
+    const tokens = await exchangeCode(oauth, activeClientId, code);
+
+    const cfg = defaultConfig();
+    cfg.roots = [configDir];
+    let current = oauth;
+    for (let i = 0; i < 70; i += 1) {
+      if (i % 15 === 0) {
+        current = new OAuthServer(configDir, cfg);
+      }
+      await registerClient(current, `Idle-${i}`);
+    }
+
+    const dynamicClients = current.listClients().filter((c) => !c.isStatic);
+    expect(dynamicClients.length).toBeLessThanOrEqual(64);
+    expect(dynamicClients.some((c) => c.clientId === activeClientId)).toBe(true);
+
+    const refreshRes = await current.handleToken(
+      new Request(`${BASE_URL}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokens.refresh_token,
+          client_id: activeClientId,
+        }).toString(),
+      }),
+      BASE_URL,
+    );
+    expect(refreshRes.status).toBe(200);
+  });
+
+  test("protects client holding an unexpired unused authorization code from eviction", async () => {
+    const cfg = defaultConfig();
+    cfg.roots = [configDir];
+    let current = oauth;
+    for (let i = 0; i < 63; i += 1) {
+      if (i % 15 === 0) {
+        current = new OAuthServer(configDir, cfg);
+      }
+      await registerClient(current, `Idle-${i}`);
+    }
+
+    const activeServer = new OAuthServer(configDir, cfg);
+    const pendingClientId = await registerClient(activeServer, "Pending Exchange");
+    const code = await authorizeClient(activeServer, pendingClientId);
+
+    for (let i = 0; i < 5; i += 1) {
+      await registerClient(activeServer, `Flood-${i}`);
+    }
+
+    const dynamicClients = activeServer.listClients().filter((c) => !c.isStatic);
+    expect(dynamicClients.length).toBeLessThanOrEqual(64);
+    expect(dynamicClients.some((c) => c.clientId === pendingClientId)).toBe(true);
+
+    const tokens = await exchangeCode(activeServer, pendingClientId, code);
+    expect(tokens.access_token.startsWith("gma_")).toBe(true);
+  });
+
+  test("returns 503 temporarily_unavailable without evicting when all 64 dynamic slots have active tokens", async () => {
+    const cfg = defaultConfig();
+    cfg.roots = [configDir];
+    const activeIds: string[] = [];
+    let current = oauth;
+    for (let i = 0; i < 64; i += 1) {
+      if (i > 0 && i % 15 === 0) {
+        current = new OAuthServer(configDir, cfg);
+      }
+      const cid = await registerClient(current, `Active-${i}`);
+      const code = await authorizeClient(current, cid);
+      await exchangeCode(current, cid, code);
+      activeIds.push(cid);
+    }
+
+    const overflowRes = await current.handleRegister(
+      new Request(`${BASE_URL}/oauth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_name: "Overflow", redirect_uris: [redirectUri] }),
+      }),
+    );
+    expect(overflowRes.status).toBe(503);
+    const overflowBody = (await overflowRes.json()) as { error: string };
+    expect(overflowBody.error).toBe("temporarily_unavailable");
+
+    const remainingIds = new Set(current.listClients().filter((c) => !c.isStatic).map((c) => c.clientId));
+    expect(remainingIds.size).toBe(64);
+    for (const id of activeIds) {
+      expect(remainingIds.has(id)).toBe(true);
+    }
+  });
+});
