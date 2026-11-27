@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { defaultConfig } from "../src/config.ts";
 import {
@@ -10,6 +10,7 @@ import {
   findTailscaleBinary,
   inspectTailscaleStatus,
   parseTailscaleStatusJson,
+  startCloudflaredQuickTunnel,
   startTailscaleFunnel,
   type TailscaleStatusInfo,
 } from "../src/tunnel.ts";
@@ -302,5 +303,87 @@ describe("Tunnel selector & custom URL normalization", () => {
 
     const cancel = await runPrompt(["q"]);
     expect(cancel.result).toEqual({ cancelled: true });
+  });
+});
+
+describe("Cloudflare Quick Tunnel", () => {
+  test("passes an isolated empty --config file and cleans it up on stop", async () => {
+    const reportDir = mkdtempSync(join(tmpdir(), "gemination-quick-report-"));
+    tempDirs.push(reportDir);
+    const reportPath = join(reportDir, "report.json");
+
+    const fakeCloudflared = makeTempScript(
+      "cloudflared-ok",
+      `import { readFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const cfgIdx = args.indexOf("--config");
+const cfgPath = cfgIdx >= 0 ? args[cfgIdx + 1] : null;
+const configContent = cfgPath ? readFileSync(cfgPath, "utf8") : null;
+writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ args, cfgPath, configContent }), "utf8");
+console.log("INF | +--------------------------------------------------------------------------------------------+");
+console.log("INF |  https://mock-quick-tunnel.trycloudflare.com                                               |");
+process.on("SIGINT", () => process.exit(0));
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
+`,
+    );
+
+    const handle = await startCloudflaredQuickTunnel("http://127.0.0.1:3847", {
+      binary: fakeCloudflared,
+      timeoutMs: 5_000,
+    });
+    expect(handle.provider).toBe("quick");
+    expect(handle.publicUrl).toBe("https://mock-quick-tunnel.trycloudflare.com");
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as {
+      args: string[];
+      cfgPath: string | null;
+      configContent: string | null;
+    };
+    expect(report.cfgPath).toBeTruthy();
+    expect(report.args).toEqual([
+      "tunnel",
+      "--config",
+      report.cfgPath!,
+      "--url",
+      "http://127.0.0.1:3847",
+      "--no-autoupdate",
+    ]);
+    expect(report.configContent?.trim()).toBe("{}");
+    expect(existsSync(report.cfgPath!)).toBe(true);
+
+    await handle.stop();
+    expect(existsSync(report.cfgPath!)).toBe(false);
+    expect(existsSync(dirname(report.cfgPath!))).toBe(false);
+  });
+
+  test("cleans up temporary --config directory if cloudflared exits unexpectedly", async () => {
+    const reportDir = mkdtempSync(join(tmpdir(), "gemination-quick-fail-"));
+    tempDirs.push(reportDir);
+    const reportPath = join(reportDir, "report.json");
+
+    const fakeCloudflared = makeTempScript(
+      "cloudflared-fail",
+      `import { writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const cfgIdx = args.indexOf("--config");
+const cfgPath = cfgIdx >= 0 ? args[cfgIdx + 1] : null;
+writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ cfgPath }), "utf8");
+console.error("simulated startup failure");
+process.exit(1);
+`,
+    );
+
+    await expect(
+      startCloudflaredQuickTunnel("http://127.0.0.1:3847", {
+        binary: fakeCloudflared,
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow("cloudflared exited unexpectedly with code 1");
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as { cfgPath: string | null };
+    expect(report.cfgPath).toBeTruthy();
+    expect(existsSync(report.cfgPath!)).toBe(false);
+    expect(existsSync(dirname(report.cfgPath!))).toBe(false);
   });
 });
