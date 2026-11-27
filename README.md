@@ -173,7 +173,7 @@ Tailscale이 이미 설치/로그인되어 있다면 개인 도메인 없이 무
 1. **Loopback 바인딩 및 관리 포트 분리**: MCP/OAuth(`3847`)와 Studio 관리 UI(`3848`) 모두 `127.0.0.1`에만 바인딩되며, 터널은 MCP 포트로만 연결되어 관리 API(`/_local/*`)에 외부나 리버스 프록시가 접근할 수 없습니다.
 2. **OAuth 2.1 + 1회성 소유자 PIN 동의**: 모든 `/mcp` 호출은 유효한 Bearer 토큰이 필요하며, 브라우저 동의 시 `scrypt` + `timingSafeEqual`로 검증되는 1회성 PIN(승인 즉시 자동 폐기·재회전, 글로벌 5회/5분 실패 잠금)을 요구합니다.
 3. **토큰/시크릿 해시 저장**: `~/.config/gemination/state.json` (`0600`)에는 원본 토큰·PIN·시크릿을 저장하지 않고 해시만 기록합니다.
-4. **Redirect URI 화이트리스트**: DCR 및 인가 요청 시 Google 공식 OAuth 리다이렉트 호스트(`oauth-redirect.googleusercontent.com`, `oauth-redirect-sandbox.googleusercontent.com`, `vertexaisearch.cloud.google.com`) 및 로컬 테스트 주소(`127.0.0.1`, `localhost`)만 허용하며 프래그먼트(`#`)·userinfo 포함 URI를 거부합니다.
+4. **Redirect URI 화이트리스트**: DCR 및 인가 요청 시 Google 공식 OAuth 리다이렉트 호스트(`oauth-redirect.googleusercontent.com`, `oauth-redirect-sandbox.googleusercontent.com`, `oauth-redirect-test.googleusercontent.com`, `vertexaisearch.cloud.google.com`) 및 로컬 테스트 주소(`127.0.0.1`, `localhost`)만 허용하며 프래그먼트(`#`)·userinfo 포함 URI를 거부합니다.
 5. **워크스페이스 격리 + Dangling Symlink & 민감 경로 차단**: `lstatSync`·`readlinkSync`·`realpathSync` 기반으로 깨진 심볼릭 링크를 악용한 탈출을 차단하며 `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.npmrc`, `~/.netrc`, `~/.git-credentials`, `~/.config/{gh,gcloud,gemination}`, `~/Library/Keychains`, Chrome 사용자 데이터 접근을 차단합니다.
 6. **최소 권한 플래그 및 주의사항**: `checkCommandSafety`는 우발적 파괴 명령을 막는 안전 가드레일이며 OS 수준 샌드박스가 아닙니다. 신뢰할 수 없는 저장소를 다룰 때는 **안전 모드(`--read-only --no-shell`)** 사용을 권장합니다 (`--no-shell` 모드에서는 `.git/config`·`.git/hooks` 수정 및 `rg`/`git` 외부 실행 옵션도 차단됩니다).
 7. **감사 로그 & 즉시 폐기**: 모든 도구 호출은 `~/.config/gemination/audit.jsonl`에 시크릿 마스킹 후 기록되며, `bun run revoke` 또는 UI로 모든 활성 토큰을 즉시 폐기할 수 있습니다.
