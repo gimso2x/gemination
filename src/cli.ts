@@ -224,7 +224,7 @@ Options:
   --profile <name>              Use an isolated named profile under ~/.config/gemination/profiles/<name>
   --config-dir <dir>            Override config/state directory (mutually exclusive with --profile)
   --no-shell                    Disable run_command / start_process tools
-  --read-only                   Disable write_file / edit_file tools
+  --read-only                   Disable write_file / edit_file / batch_edit tools
   --no-secret-shield            Disable automatic masking of API keys/tokens in MCP tool output
   --no-caffeinate               Disable sleep prevention while serving (macOS/Windows/Linux)
   --no-probe                    Skip external HTTPS self-check probe after tunnel startup
@@ -1381,7 +1381,7 @@ function runConnectCommand(parsed: ParsedArgs): void {
     } else {
       console.log("  1. 터미널에서 `gemini` 실행 후 개인 Google 계정으로 로그인");
     }
-    console.log("  3. Gemini CLI 안에서 `/mcp` 입력해 `gemination` 도구 12종 연결 확인");
+    console.log("  3. Gemini CLI 안에서 `/mcp` 입력해 `gemination` 도구 13종 연결 확인");
   }
 }
 

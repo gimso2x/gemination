@@ -5,6 +5,7 @@ import {
   readdirSync,
   readFileSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { arch, hostname, platform, release } from "node:os";
@@ -30,6 +31,8 @@ import { maskSecrets, shieldToolResult } from "./secrets-shield.ts";
 import type { ToolContext } from "./types.ts";
 
 export const MAX_EDITABLE_FILE_BYTES = 10 * 1024 * 1024;
+export const MAX_BATCH_OPERATIONS = 50;
+export const MAX_BATCH_TOTAL_BYTES = 20 * 1024 * 1024;
 export const SAFE_GIT_ARGS = [
   "-c",
   "core.fsmonitor=false",
@@ -403,12 +406,306 @@ function fallbackSearch(
   return results;
 }
 
+interface BatchEditOp {
+  path: string;
+  action?: "edit" | "write";
+  target?: string;
+  replacement?: string;
+  replaceAll?: boolean;
+  content?: string;
+  append?: boolean;
+}
+
+interface StagedBatchFile {
+  path: string;
+  existed: boolean;
+  originalBytes: Buffer | null;
+  content: string;
+}
+
+function isBinaryBuffer(raw: Buffer): boolean {
+  return raw.subarray(0, Math.min(raw.byteLength, 8192)).includes(0);
+}
+
+function applySnippetReplacement(
+  content: string,
+  safePath: string,
+  target: string,
+  replacement: string,
+  replaceAll: boolean,
+): { ok: true; updated: string; replacements: number } | { ok: false; error: string } {
+  const occurrences = content.split(target).length - 1;
+  if (occurrences === 0) {
+    return { ok: false, error: `Target snippet not found in ${safePath}` };
+  }
+  if (occurrences > 1 && !replaceAll) {
+    return {
+      ok: false,
+      error: `Target snippet matched ${occurrences} times in ${safePath}; pass replaceAll=true or provide more surrounding context`,
+    };
+  }
+  const updated = replaceAll
+    ? content.split(target).join(replacement)
+    : content.replace(target, () => replacement);
+  return {
+    ok: true,
+    updated,
+    replacements: replaceAll ? occurrences : 1,
+  };
+}
+
+function resolveBatchOpAction(
+  op: BatchEditOp,
+  idx: number,
+): { ok: true; action: "edit" | "write" } | { ok: false; error: string } {
+  if (op.action) {
+    return { ok: true, action: op.action };
+  }
+  const hasContent = op.content !== undefined;
+  const hasEditFields = op.target !== undefined || op.replacement !== undefined;
+  if (hasContent && hasEditFields) {
+    return {
+      ok: false,
+      error: `Edit #${idx} (${op.path}): ambiguous operation; specify action='edit' or action='write'. No files were modified.`,
+    };
+  }
+  return { ok: true, action: hasContent ? "write" : "edit" };
+}
+
+function checkBatchWritePathCollisions(
+  safePath: string,
+  opPath: string,
+  idx: number,
+  staged: ReadonlyMap<string, StagedBatchFile>,
+): string | null {
+  let cursor = dirname(safePath);
+  while (true) {
+    if (staged.has(cursor)) {
+      return `Edit #${idx} (${opPath}): Parent path is staged as a file (${cursor}). No files were modified.`;
+    }
+    if (existsSync(cursor)) {
+      if (!statSync(cursor).isDirectory()) {
+        return `Edit #${idx} (${opPath}): Parent path is not a directory (${cursor}). No files were modified.`;
+      }
+      break;
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+
+  if (!staged.has(safePath)) {
+    for (const stagedPath of staged.keys()) {
+      if (stagedPath !== safePath && isPathInside(stagedPath, safePath, process.platform, CASE_INSENSITIVE_FS)) {
+        return `Edit #${idx} (${opPath}): Path conflicts with staged child path (${stagedPath}). No files were modified.`;
+      }
+    }
+  }
+
+  return null;
+}
+
+function stageBatchWrite(
+  safePath: string,
+  op: BatchEditOp,
+  idx: number,
+  staged: Map<string, StagedBatchFile>,
+): { ok: true; result: Record<string, unknown> } | { ok: false; error: string } {
+  if (typeof op.content !== "string") {
+    return {
+      ok: false,
+      error: `Edit #${idx} (${op.path}): write operation requires string "content". No files were modified.`,
+    };
+  }
+
+  const collision = checkBatchWritePathCollisions(safePath, op.path, idx, staged);
+  if (collision) {
+    return { ok: false, error: collision };
+  }
+
+  const existingStaged = staged.get(safePath);
+  let existed = false;
+  let originalBytes: Buffer | null = null;
+  let baseContent = "";
+
+  if (existingStaged) {
+    existed = existingStaged.existed;
+    originalBytes = existingStaged.originalBytes;
+    baseContent = existingStaged.content;
+  } else if (existsSync(safePath)) {
+    const st = statSync(safePath);
+    if (!st.isFile()) {
+      return {
+        ok: false,
+        error: `Edit #${idx} (${op.path}): Not a regular file: ${safePath}. No files were modified.`,
+      };
+    }
+    existed = true;
+    if (op.append) {
+      if (st.size > MAX_EDITABLE_FILE_BYTES) {
+        return {
+          ok: false,
+          error: `Edit #${idx} (${op.path}): File too large (${st.size} bytes; max ${MAX_EDITABLE_FILE_BYTES}): ${safePath}. No files were modified.`,
+        };
+      }
+      const raw = readFileSync(safePath);
+      if (isBinaryBuffer(raw)) {
+        return {
+          ok: false,
+          error: `Edit #${idx} (${op.path}): Binary file detected (${st.size} bytes): ${safePath}. No files were modified.`,
+        };
+      }
+      originalBytes = raw;
+      baseContent = raw.toString("utf8");
+    } else {
+      originalBytes = st.size <= MAX_EDITABLE_FILE_BYTES ? readFileSync(safePath) : null;
+    }
+  }
+
+  const nextContent = op.append ? baseContent + op.content : op.content;
+  const nextBytes = Buffer.byteLength(nextContent, "utf8");
+  if (nextBytes > MAX_EDITABLE_FILE_BYTES) {
+    return {
+      ok: false,
+      error: `Edit #${idx} (${op.path}): Resulting file size (${nextBytes} bytes) exceeds limit (${MAX_EDITABLE_FILE_BYTES} bytes). No files were modified.`,
+    };
+  }
+
+  staged.set(safePath, {
+    path: safePath,
+    existed,
+    originalBytes,
+    content: nextContent,
+  });
+
+  return {
+    ok: true,
+    result: {
+      index: idx,
+      path: safePath,
+      action: "write",
+      bytesWritten: Buffer.byteLength(op.content, "utf8"),
+      append: Boolean(op.append),
+    },
+  };
+}
+
+function stageBatchEdit(
+  safePath: string,
+  op: BatchEditOp,
+  idx: number,
+  staged: Map<string, StagedBatchFile>,
+): { ok: true; result: Record<string, unknown> } | { ok: false; error: string } {
+  if (typeof op.target !== "string" || op.target.length === 0 || typeof op.replacement !== "string") {
+    return {
+      ok: false,
+      error: `Edit #${idx} (${op.path}): edit operation requires non-empty "target" and string "replacement". No files were modified.`,
+    };
+  }
+
+  let entry = staged.get(safePath);
+  if (!entry) {
+    const st = statSync(safePath);
+    if (!st.isFile()) {
+      return {
+        ok: false,
+        error: `Edit #${idx} (${op.path}): Not a regular file: ${safePath}. No files were modified.`,
+      };
+    }
+    if (st.size > MAX_EDITABLE_FILE_BYTES) {
+      return {
+        ok: false,
+        error: `Edit #${idx} (${op.path}): File too large (${st.size} bytes; max ${MAX_EDITABLE_FILE_BYTES}): ${safePath}. No files were modified.`,
+      };
+    }
+    const raw = readFileSync(safePath);
+    if (isBinaryBuffer(raw)) {
+      return {
+        ok: false,
+        error: `Edit #${idx} (${op.path}): Binary file detected (${st.size} bytes): ${safePath}. No files were modified.`,
+      };
+    }
+    entry = {
+      path: safePath,
+      existed: true,
+      originalBytes: raw,
+      content: raw.toString("utf8"),
+    };
+  }
+
+  const replaced = applySnippetReplacement(
+    entry.content,
+    safePath,
+    op.target,
+    op.replacement,
+    Boolean(op.replaceAll),
+  );
+  if (!replaced.ok) {
+    return {
+      ok: false,
+      error: `Edit #${idx} (${op.path}): ${replaced.error}. No files were modified.`,
+    };
+  }
+
+  const updatedBytes = Buffer.byteLength(replaced.updated, "utf8");
+  if (updatedBytes > MAX_EDITABLE_FILE_BYTES) {
+    return {
+      ok: false,
+      error: `Edit #${idx} (${op.path}): Resulting file size (${updatedBytes} bytes) exceeds limit (${MAX_EDITABLE_FILE_BYTES} bytes). No files were modified.`,
+    };
+  }
+
+  staged.set(safePath, {
+    path: safePath,
+    existed: entry.existed,
+    originalBytes: entry.originalBytes,
+    content: replaced.updated,
+  });
+
+  return {
+    ok: true,
+    result: {
+      index: idx,
+      path: safePath,
+      action: "edit",
+      replacements: replaced.replacements,
+    },
+  };
+}
+
+function commitStagedBatch(staged: ReadonlyMap<string, StagedBatchFile>): void {
+  const written: StagedBatchFile[] = [];
+  try {
+    for (const entry of staged.values()) {
+      mkdirSync(dirname(entry.path), { recursive: true });
+      writeFileSync(entry.path, entry.content, "utf8");
+      written.push(entry);
+    }
+  } catch (err) {
+    for (let i = written.length - 1; i >= 0; i -= 1) {
+      const entry = written[i]!;
+      try {
+        if (entry.existed) {
+          if (entry.originalBytes !== null) {
+            writeFileSync(entry.path, entry.originalBytes);
+          }
+        } else if (existsSync(entry.path)) {
+          unlinkSync(entry.path);
+        }
+      } catch {
+        // Best-effort rollback for already-written files.
+      }
+    }
+    throw err;
+  }
+}
+
 export function createGeminationMcpServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
     { name: "gemination", version: PKG_VERSION },
     {
       instructions:
-        "Gemination connects Gemini Web to the user's local PC inside configured workspace roots. Inspect local_info first to see allowed roots and capabilities. Prefer read/search tools before editing, keep commands concise, and use start_process/poll_process for long-running tasks.",
+        "Gemination connects Gemini Web to the user's local PC inside configured workspace roots. Inspect local_info first to see allowed roots and capabilities. Prefer read/search tools before editing, use batch_edit when modifying or creating multiple files in one step, keep commands concise, and use start_process/poll_process for long-running tasks.",
     },
   );
 
@@ -673,24 +970,133 @@ export function createGeminationMcpServer(ctx: ToolContext): McpServer {
           return errorResult(`File too large (${st.size} bytes; max ${MAX_EDITABLE_FILE_BYTES}): ${safePath}`);
         }
         const original = readFileSync(safePath, "utf8");
-        const occurrences = original.split(target).length - 1;
-        if (occurrences === 0) {
-          return errorResult(`Target snippet not found in ${safePath}`);
+        const replaced = applySnippetReplacement(original, safePath, target, replacement, replaceAll);
+        if (!replaced.ok) {
+          return errorResult(replaced.error);
         }
-        if (occurrences > 1 && !replaceAll) {
-          return errorResult(
-            `Target snippet matched ${occurrences} times in ${safePath}; pass replaceAll=true or provide more surrounding context`,
-          );
-        }
-        const updated = replaceAll
-          ? original.split(target).join(replacement)
-          : original.replace(target, () => replacement);
-        writeFileSync(safePath, updated, "utf8");
+        writeFileSync(safePath, replaced.updated, "utf8");
         return jsonResult({
           path: safePath,
-          replacements: replaceAll ? occurrences : 1,
+          replacements: replaced.replacements,
         });
       }),
+  );
+
+  server.registerTool(
+    "batch_edit",
+    {
+      description:
+        "Apply multiple file edits and/or file writes atomically in a single call inside allowed workspace roots. Prefer this over repeated edit_file or write_file calls when changing multiple files or multiple sections.",
+      inputSchema: {
+        edits: z
+          .array(
+            z.object({
+              path: z.string().min(1),
+              action: z.enum(["edit", "write"]).optional(),
+              target: z.string().optional(),
+              replacement: z.string().optional(),
+              replaceAll: z.boolean().optional().default(false),
+              content: z.string().optional(),
+              append: z.boolean().optional().default(false),
+            }),
+          )
+          .min(1)
+          .max(MAX_BATCH_OPERATIONS),
+        dryRun: z.boolean().optional().default(false),
+      },
+      annotations: writeAnn,
+    },
+    ({ edits, dryRun }) => {
+      const uniquePaths = [...new Set(edits.map((op) => op.path))];
+      const preview =
+        uniquePaths.slice(0, 5).join(", ")
+        + (uniquePaths.length > 5 ? `,+${uniquePaths.length - 5} more` : "");
+      const summary = `batch_edit${dryRun ? " (dryRun)" : ""} ${edits.length} ops on ${uniquePaths.length} file(s): ${preview}`;
+
+      return runTool("batch_edit", summary, () => {
+        if (!ctx.config.allowWrite) {
+          throw new SecurityError("Filesystem writes are disabled (--read-only mode)");
+        }
+
+        const staged = new Map<string, StagedBatchFile>();
+        const opResults: Array<Record<string, unknown>> = [];
+
+        for (let idx = 0; idx < edits.length; idx += 1) {
+          const op = edits[idx]!;
+          const actionRes = resolveBatchOpAction(op, idx);
+          if (!actionRes.ok) {
+            return errorResult(actionRes.error);
+          }
+
+          const action = actionRes.action;
+          if (action === "edit" && (typeof op.target !== "string" || op.target.length === 0 || typeof op.replacement !== "string")) {
+            return errorResult(
+              `Edit #${idx} (${op.path}): edit operation requires non-empty "target" and string "replacement". No files were modified.`,
+            );
+          }
+          if (action === "write" && typeof op.content !== "string") {
+            return errorResult(
+              `Edit #${idx} (${op.path}): write operation requires string "content". No files were modified.`,
+            );
+          }
+
+          let safePath: string;
+          if (action === "write") {
+            safePath = resolveSafePath(op.path, ctx.config.roots, ctx.defaultCwd, {
+              allowMissingLeaf: true,
+              configDir: ctx.configDir,
+            });
+          } else {
+            const candidate = resolveSafePath(op.path, ctx.config.roots, ctx.defaultCwd, {
+              allowMissingLeaf: true,
+              configDir: ctx.configDir,
+            });
+            safePath = staged.has(candidate)
+              ? candidate
+              : resolveSafePath(op.path, ctx.config.roots, ctx.defaultCwd, {
+                  allowMissingLeaf: false,
+                  configDir: ctx.configDir,
+                });
+          }
+
+          if (!ctx.config.allowShell && isProtectedGitMetadataPath(safePath)) {
+            throw new SecurityError(
+              "Modifying .git/config or .git/hooks is blocked when shell execution is disabled (--no-shell)",
+            );
+          }
+
+          const stepRes =
+            action === "write"
+              ? stageBatchWrite(safePath, op, idx, staged)
+              : stageBatchEdit(safePath, op, idx, staged);
+          if (!stepRes.ok) {
+            return errorResult(stepRes.error);
+          }
+          opResults.push(stepRes.result);
+        }
+
+        let totalStagedBytes = 0;
+        for (const entry of staged.values()) {
+          totalStagedBytes += Buffer.byteLength(entry.content, "utf8");
+        }
+        if (totalStagedBytes > MAX_BATCH_TOTAL_BYTES) {
+          return errorResult(
+            `Batch total staged size (${totalStagedBytes} bytes) exceeds limit (${MAX_BATCH_TOTAL_BYTES} bytes). No files were modified.`,
+          );
+        }
+
+        if (!dryRun) {
+          commitStagedBatch(staged);
+        }
+
+        return jsonResult({
+          dryRun,
+          operationsApplied: opResults.length,
+          filesModified: staged.size,
+          results: opResults,
+        });
+      });
+    },
   );
 
   server.registerTool(

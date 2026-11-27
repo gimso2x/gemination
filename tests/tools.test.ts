@@ -449,17 +449,199 @@ describe("Gemination MCP tools", () => {
           // Already exited.
         }
       }
-    } finally {
-      for (const pid of [runGcPid, bgGcPid]) {
-        if (pid > 0) {
-          try {
-            process.kill(pid, "SIGKILL");
-          } catch {
-            // Already exited.
+      } finally {
+        for (const pid of [runGcPid, bgGcPid]) {
+          if (pid > 0) {
+            try {
+              process.kill(pid, "SIGKILL");
+            } catch {
+              // Already exited.
+            }
           }
         }
+        await close();
       }
+    });
+
+  test("batch_edit applies multi-file writes and edits atomically in one call", async () => {
+    const { client, close } = await connectTestClient();
+    try {
+      writeFileSync(join(workspaceDir, "a.txt"), "alpha\nfoo\nfoo\n$token\n", "utf8");
+      writeFileSync(join(workspaceDir, "log.txt"), "start\n", "utf8");
+
+      const res = parseToolJson(
+        await client.callTool({
+          name: "batch_edit",
+          arguments: {
+            edits: [
+              // Sequential edits on the same file, including replaceAll and $-replacement preservation
+              { path: "a.txt", action: "edit", target: "foo", replacement: "bar", replaceAll: true },
+              { path: "a.txt", target: "$token", replacement: "$& $$ $` $' ok" },
+              // Create a new file (inferred write) and edit it within the same batch
+              { path: "sub/new.txt", content: "hello placeholder\n" },
+              { path: "sub/new.txt", target: "placeholder", replacement: "world" },
+              // Append to an existing file
+              { path: "log.txt", action: "write", content: "next\n", append: true },
+            ],
+          },
+        }),
+      );
+
+      expect(res.dryRun).toBe(false);
+      expect(res.operationsApplied).toBe(5);
+      expect(res.filesModified).toBe(3);
+
+      expect(readFileSync(join(workspaceDir, "a.txt"), "utf8")).toBe("alpha\nbar\nbar\n$& $$ $` $' ok\n");
+      expect(readFileSync(join(workspaceDir, "sub", "new.txt"), "utf8")).toBe("hello world\n");
+      expect(readFileSync(join(workspaceDir, "log.txt"), "utf8")).toBe("start\nnext\n");
+    } finally {
       await close();
+    }
+  });
+
+  test("batch_edit rolls back in memory (zero disk changes) when any operation fails", async () => {
+    const { client, close } = await connectTestClient({ allowWrite: true, allowShell: false });
+    try {
+      writeFileSync(join(workspaceDir, "keep.txt"), "original\n", "utf8");
+
+      // Missing target snippet in a later op must leave earlier ops and new files untouched
+      const missingTargetRes = await client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [
+            { path: "keep.txt", target: "original", replacement: "changed" },
+            { path: "created-if-non-atomic.txt", content: "should not exist\n" },
+            { path: "keep.txt", target: "not-found", replacement: "x" },
+          ],
+        },
+      });
+      expect(missingTargetRes.isError).toBe(true);
+      expect(readFileSync(join(workspaceDir, "keep.txt"), "utf8")).toBe("original\n");
+      expect(existsSync(join(workspaceDir, "created-if-non-atomic.txt"))).toBe(false);
+
+      // Path outside workspace root in a later op must fail cleanly without touching earlier files
+      const outsideRes = await client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [
+            { path: "keep.txt", target: "original", replacement: "changed" },
+            { path: "../escape.txt", content: "nope" },
+          ],
+        },
+      });
+      expect(outsideRes.isError).toBe(true);
+      expect(readFileSync(join(workspaceDir, "keep.txt"), "utf8")).toBe("original\n");
+
+      // Protected .git/config write under --no-shell must block the whole batch
+      const gitConfigRes = await client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [
+            { path: "keep.txt", target: "original", replacement: "changed" },
+            { path: ".git/config", content: "[core]\n\tfsmonitor = evil\n" },
+          ],
+        },
+      });
+      expect(gitConfigRes.isError).toBe(true);
+      expect(readFileSync(join(workspaceDir, "keep.txt"), "utf8")).toBe("original\n");
+    } finally {
+      await close();
+    }
+  });
+
+  test("batch_edit supports dryRun, enforces allowWrite, validates edge cases, and exports Gemini-compatible schema", async () => {
+    const rwConn = await connectTestClient();
+    try {
+      writeFileSync(join(workspaceDir, "dry.txt"), "before\n", "utf8");
+      writeFileSync(join(workspaceDir, "bin.dat"), new Uint8Array([0, 1, 2, 0, 255]));
+
+      // dryRun previews without modifying disk
+      const dryRes = parseToolJson(
+        await rwConn.client.callTool({
+          name: "batch_edit",
+          arguments: {
+            dryRun: true,
+            edits: [
+              { path: "dry.txt", target: "before", replacement: "after" },
+              { path: "dry-new.txt", content: "new\n" },
+            ],
+          },
+        }),
+      );
+      expect(dryRes.dryRun).toBe(true);
+      expect(dryRes.operationsApplied).toBe(2);
+      expect(dryRes.filesModified).toBe(2);
+      expect(readFileSync(join(workspaceDir, "dry.txt"), "utf8")).toBe("before\n");
+      expect(existsSync(join(workspaceDir, "dry-new.txt"))).toBe(false);
+
+      // Binary file rejection
+      const binRes = await rwConn.client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [{ path: "bin.dat", target: "a", replacement: "b" }],
+        },
+      });
+      expect(binRes.isError).toBe(true);
+
+      // Ambiguous op (both target and content without explicit action)
+      const ambigRes = await rwConn.client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [{ path: "dry.txt", target: "before", replacement: "after", content: "x" }],
+        },
+      });
+      expect(ambigRes.isError).toBe(true);
+
+      // File vs directory collision in same batch (file staged first, then child under it)
+      const collisionRes1 = await rwConn.client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [
+            { path: "node", content: "file\n" },
+            { path: "node/child.txt", content: "child\n" },
+          ],
+        },
+      });
+      expect(collisionRes1.isError).toBe(true);
+      expect(existsSync(join(workspaceDir, "node"))).toBe(false);
+
+      // File vs directory collision in reverse order (child staged first, then ancestor as file)
+      const collisionRes2 = await rwConn.client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [
+            { path: "dir/child.txt", content: "child\n" },
+            { path: "dir", content: "file\n" },
+          ],
+        },
+      });
+      expect(collisionRes2.isError).toBe(true);
+      expect(existsSync(join(workspaceDir, "dir"))).toBe(false);
+
+      // Gemini Web JSON Schema compatibility: readOnlyHint === false, no oneOf/anyOf
+      const listed = await rwConn.client.listTools();
+      const batchTool = listed.tools.find((t) => t.name === "batch_edit");
+      expect(batchTool).toBeDefined();
+      expect(batchTool?.annotations?.readOnlyHint).toBe(false);
+      const schemaText = JSON.stringify(batchTool?.inputSchema ?? {});
+      expect(schemaText).not.toContain('"oneOf"');
+      expect(schemaText).not.toContain('"anyOf"');
+    } finally {
+      await rwConn.close();
+    }
+
+    // --read-only (allowWrite: false) blocks batch_edit
+    const roConn = await connectTestClient({ allowWrite: false, allowShell: false });
+    try {
+      const blocked = await roConn.client.callTool({
+        name: "batch_edit",
+        arguments: {
+          edits: [{ path: "blocked.txt", content: "nope" }],
+        },
+      });
+      expect(blocked.isError).toBe(true);
+    } finally {
+      await roConn.close();
     }
   });
 });

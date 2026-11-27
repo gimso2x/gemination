@@ -153,7 +153,7 @@ describe("Local MCP clients registry (src/mcp-clients.ts)", () => {
 });
 
 describe("MCP stdio transport end-to-end", () => {
-  test("serves all 12 tools over stdio without OAuth or tunnel, enforcing Secret Shield and path jail", async () => {
+  test("serves all 13 tools over stdio without OAuth or tunnel, enforcing Secret Shield and path jail", async () => {
     const ws = realpathSync(makeTempDir("gemination-stdio-ws-"));
     const outside = realpathSync(makeTempDir("gemination-stdio-out-"));
     const cfgDir = makeTempDir("gemination-stdio-cfg-");
@@ -176,7 +176,8 @@ describe("MCP stdio transport end-to-end", () => {
     try {
       await client.connect(transport);
       const listed = await client.listTools();
-      expect(listed.tools.length).toBe(12);
+      expect(listed.tools.length).toBe(13);
+      expect(listed.tools.map((t) => t.name)).toContain("batch_edit");
 
       const info = await client.callTool({ name: "local_info", arguments: {} });
       expect(info.isError).not.toBe(true);

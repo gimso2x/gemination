@@ -194,6 +194,7 @@ describe("Full HTTP OAuth + Streamable HTTP MCP integration", () => {
     expect(listRes.status).toBe(200);
     const listJson = (await listRes.json()) as { result: { tools: Array<{ name: string }> } };
     expect(listJson.result.tools.map((t) => t.name)).toContain("run_command");
+    expect(listJson.result.tools.map((t) => t.name)).toContain("batch_edit");
 
     const writeCall = await mcpPost(mcpUrl, tokens.access_token, {
       jsonrpc: "2.0",
