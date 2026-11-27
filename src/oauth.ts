@@ -385,15 +385,40 @@ export class OAuthServer {
     return this.dcrTimestamps.length >= DCR_RATE_LIMIT_MAX;
   }
 
-  private evictOldestDynamicClientsIfNeeded(): void {
-    const dynamic = Object.values(this.state.clients)
-      .filter((c) => !c.isStatic)
-      .sort((a, b) => a.createdAt - b.createdAt);
-    while (dynamic.length >= MAX_DYNAMIC_CLIENTS) {
-      const oldest = dynamic.shift();
-      if (!oldest) break;
-      delete this.state.clients[oldest.clientId];
+  private getProtectedClientIds(now: number): Set<string> {
+    const protectedIds = new Set<string>();
+    for (const token of Object.values(this.state.tokens)) {
+      if (!token.revoked && token.expiresAt > now) {
+        protectedIds.add(token.clientId);
+      }
     }
+    for (const authCode of this.authCodes.values()) {
+      if (!authCode.used && authCode.expiresAt > now) {
+        protectedIds.add(authCode.clientId);
+      }
+    }
+    return protectedIds;
+  }
+
+  private evictOldestDynamicClientsIfNeeded(now: number): boolean {
+    const dynamic = Object.values(this.state.clients).filter((c) => !c.isStatic);
+    if (dynamic.length < MAX_DYNAMIC_CLIENTS) {
+      return true;
+    }
+
+    const protectedIds = this.getProtectedClientIds(now);
+    const evictable = dynamic
+      .filter((c) => !protectedIds.has(c.clientId))
+      .sort((a, b) => a.createdAt - b.createdAt);
+
+    let remaining = dynamic.length;
+    for (const candidate of evictable) {
+      if (remaining < MAX_DYNAMIC_CLIENTS) break;
+      delete this.state.clients[candidate.clientId];
+      remaining -= 1;
+    }
+
+    return remaining < MAX_DYNAMIC_CLIENTS;
   }
 
   isRedirectUriAllowed(uriString: string): boolean {
@@ -523,7 +548,13 @@ export class OAuthServer {
       clientSecretHash,
       createdAt: Date.now(),
     };
-    this.evictOldestDynamicClientsIfNeeded();
+    if (!this.evictOldestDynamicClientsIfNeeded(now)) {
+      return oauthError(
+        "temporarily_unavailable",
+        "Maximum active dynamic OAuth clients reached. Revoke an unused session before registering another client.",
+        503,
+      );
+    }
     this.state.clients[clientId] = record;
     this.persist();
     this.recordEvent("registered", `${clientName} (${clientId}) 클라이언트 등록됨`);

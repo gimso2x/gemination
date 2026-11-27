@@ -103,6 +103,7 @@ export function killProcessGracefully(
   proc: { pid?: number; kill: (sig?: number | NodeJS.Signals) => void },
   force = false,
   platform: SupportedPlatform = process.platform,
+  options?: { processGroup?: boolean },
 ): void {
   if (platform === "win32") {
     if (typeof proc.pid === "number" && proc.pid > 0) {
@@ -123,8 +124,18 @@ export function killProcessGracefully(
     return;
   }
 
+  const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
+  if (options?.processGroup && typeof proc.pid === "number" && proc.pid > 0) {
+    try {
+      process.kill(-proc.pid, signal);
+      return;
+    } catch {
+      // Fall back to direct process signal if group leader already exited or EPERM.
+    }
+  }
+
   try {
-    proc.kill(force ? "SIGKILL" : "SIGTERM");
+    proc.kill(signal);
   } catch {
     // Ignore already exited.
   }
