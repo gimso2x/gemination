@@ -31,6 +31,7 @@ const ALLOWED_SCOPES = ["mcp:tools", "offline_access"];
 const DEFAULT_REDIRECT_HOSTS = new Set([
   "oauth-redirect.googleusercontent.com",
   "oauth-redirect-sandbox.googleusercontent.com",
+  "oauth-redirect-test.googleusercontent.com",
   "vertexaisearch.cloud.google.com",
 ]);
 
@@ -740,7 +741,7 @@ export class OAuthServer {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
-        "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${redirectOrigin}`,
+        "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' ${redirectOrigin} https:`,
         "X-Frame-Options": "DENY",
         "X-Content-Type-Options": "nosniff",
       },
