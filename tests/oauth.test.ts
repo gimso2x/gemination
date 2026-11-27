@@ -89,6 +89,41 @@ describe("OAuthServer metadata and registration", () => {
     expect(fragRes.status).toBe(400);
   });
 
+  test("DCR accepts Gemini Web 6-URI payload including oauth-redirect-test with client_secret_post", async () => {
+    const geminiUris = [
+      "https://oauth-redirect-sandbox.googleusercontent.com/r/user_bound_custom-mcp-test",
+      "https://oauth-redirect-test.googleusercontent.com/r/user_bound_custom-mcp-test",
+      "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-test",
+      "https://oauth-redirect-sandbox.googleusercontent.com/a/user_bound_custom-mcp-test",
+      "https://oauth-redirect-test.googleusercontent.com/a/user_bound_custom-mcp-test",
+      "https://oauth-redirect.googleusercontent.com/a/user_bound_custom-mcp-test",
+    ];
+    const res = await oauth.handleRegister(
+      new Request(`${BASE_URL}/oauth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Google",
+          redirect_uris: geminiUris,
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          token_endpoint_auth_method: "client_secret_post",
+        }),
+      }),
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      client_id: string;
+      client_secret?: string;
+      redirect_uris: string[];
+      token_endpoint_auth_method: string;
+    };
+    expect(body.client_id.startsWith("gem_")).toBe(true);
+    expect(body.client_secret?.startsWith("gsec_")).toBe(true);
+    expect(body.token_endpoint_auth_method).toBe("client_secret_post");
+    expect(body.redirect_uris).toEqual(geminiUris);
+  });
+
   test("enforces global PIN rate limit across spoofed proxy headers and consumes one-time PIN", async () => {
     delete process.env.GEMINATION_PIN;
     const cfg = defaultConfig();
@@ -181,7 +216,7 @@ describe("OAuthServer authorization, PKCE, RFC 8707, and revocation", () => {
     const getRes = oauth.handleAuthorizeGet(getUrl, BASE_URL);
     expect(getRes.status).toBe(200);
     const csp = getRes.headers.get("content-security-policy") ?? "";
-    expect(csp).toContain("form-action 'self' https://oauth-redirect.googleusercontent.com");
+    expect(csp).toContain("form-action 'self' https://oauth-redirect.googleusercontent.com https:");
     const html = await getRes.text();
     expect(html).toContain("Authorize Local PC Access");
 
