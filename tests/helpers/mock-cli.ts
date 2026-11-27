@@ -38,7 +38,11 @@ function ensureWinDispatcher(): string {
   compiledWinDispatcher = outPath;
   process.on("exit", () => {
     if (dispatcherTempDir) {
-      rmSync(dispatcherTempDir, { recursive: true, force: true });
+      try {
+        rmSync(dispatcherTempDir, { recursive: true, force: true });
+      } catch {
+        // Ignore transient Windows handle locks at process teardown.
+      }
     }
   });
   return outPath;

@@ -214,20 +214,39 @@ async function runBoundedSubprocess(
 
   const streamAbort = new AbortController();
   let timedOut = false;
+  let procExited = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
   const timer = setTimeout(() => {
     timedOut = true;
+    if (procExited) {
+      // Leader already exited before timeoutMs while a descendant retained stdio handles.
+      if (useProcessGroup) {
+        killProcessGracefully(proc, true, process.platform, { processGroup: true });
+      }
+      drainTimer = setTimeout(() => {
+        streamAbort.abort();
+      }, 250);
+      return;
+    }
     killProcessGracefully(proc, false, process.platform, { processGroup: useProcessGroup });
-    killTimer = setTimeout(() => {
-      killProcessGracefully(proc, true, process.platform, { processGroup: useProcessGroup });
-    }, 1500);
+    if (useProcessGroup) {
+      killTimer = setTimeout(() => {
+        if (!procExited) {
+          killProcessGracefully(proc, true, process.platform, { processGroup: true });
+        }
+      }, 1500);
+    }
   }, timeoutMs);
 
   const exitedPromise = proc.exited.then((code) => {
+    procExited = true;
     if (timedOut) {
-      // Stop waiting on leaked stdout/stderr FDs if a grandchild escaped the process group.
+      // Stop waiting on leaked stdout/stderr FDs if a grandchild survived or escaped the PGID.
       drainTimer = setTimeout(() => {
+        if (useProcessGroup) {
+          killProcessGracefully(proc, true, process.platform, { processGroup: true });
+        }
         streamAbort.abort();
       }, 250);
     }

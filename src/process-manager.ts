@@ -214,14 +214,14 @@ export class ProcessManager {
     if (!entry) {
       throw new Error(`Unknown process id: ${id}`);
     }
-    if (entry.status === "running") {
+    if (entry.exitCode === null && (entry.status === "running" || (force && entry.status === "killed"))) {
       const sig = force ? "SIGKILL" : "SIGTERM";
       entry.signal = sig;
       entry.status = "killed";
       killProcessGracefully(entry.proc, force, process.platform, {
         processGroup: process.platform !== "win32",
       });
-      entry.endedAt = new Date().toISOString();
+      entry.endedAt ??= new Date().toISOString();
     }
     return this.toInfo(entry);
   }
@@ -233,13 +233,13 @@ export class ProcessManager {
   stopAll(): void {
     const useProcessGroup = process.platform !== "win32";
     for (const entry of this.entries.values()) {
-      if (entry.status === "running") {
+      if (entry.exitCode === null && entry.status !== "exited") {
         killProcessGracefully(entry.proc, true, process.platform, {
           processGroup: useProcessGroup,
         });
         entry.status = "killed";
         entry.signal = "SIGKILL";
-        entry.endedAt = new Date().toISOString();
+        entry.endedAt ??= new Date().toISOString();
       }
     }
   }
