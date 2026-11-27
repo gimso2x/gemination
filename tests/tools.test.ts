@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -292,6 +292,93 @@ describe("Gemination MCP tools", () => {
       });
       expect(gitTrailingDotWrite.isError).toBe(true);
     } finally {
+      await close();
+    }
+  });
+
+  test("terminates POSIX grandchild processes holding pipes on run_command timeout and stop_process", async () => {
+    if (process.platform === "win32") return;
+
+    const { client, close } = await connectTestClient();
+    let runGcPid = 0;
+    let bgGcPid = 0;
+    const isPidAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const waitPidGone = async (pid: number): Promise<boolean> => {
+      const deadline = Date.now() + 1500;
+      while (Date.now() < deadline) {
+        if (!isPidAlive(pid)) return true;
+        await Bun.sleep(25);
+      }
+      return !isPidAlive(pid);
+    };
+
+    try {
+      const startedAt = Date.now();
+      const timedOutRes = parseToolJson(
+        await client.callTool({
+          name: "run_command",
+          arguments: {
+            command: "(sleep 30) & printf '%s' \"$!\" > _run_gc.pid; sleep 30",
+            timeoutMs: 600,
+          },
+        }),
+      );
+      const elapsedMs = Date.now() - startedAt;
+      expect(timedOutRes.timedOut).toBe(true);
+      expect(elapsedMs).toBeLessThan(3000);
+
+      const runPidPath = join(workspaceDir, "_run_gc.pid");
+      expect(existsSync(runPidPath)).toBe(true);
+      runGcPid = Number.parseInt(readFileSync(runPidPath, "utf8").trim(), 10);
+      expect(runGcPid).toBeGreaterThan(0);
+      expect(await waitPidGone(runGcPid)).toBe(true);
+
+      const bgStarted = parseToolJson(
+        await client.callTool({
+          name: "start_process",
+          arguments: {
+            command: "(sleep 30) & printf '%s' \"$!\" > _bg_gc.pid; echo ready; wait",
+          },
+        }),
+      );
+      const procId = String(bgStarted.id);
+      const bgPidPath = join(workspaceDir, "_bg_gc.pid");
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const polled = parseToolJson(
+          await client.callTool({ name: "poll_process", arguments: { id: procId } }),
+        );
+        if (String(polled.stdoutChunk ?? "").includes("ready") && existsSync(bgPidPath)) {
+          break;
+        }
+        await Bun.sleep(30);
+      }
+      expect(existsSync(bgPidPath)).toBe(true);
+      bgGcPid = Number.parseInt(readFileSync(bgPidPath, "utf8").trim(), 10);
+      expect(bgGcPid).toBeGreaterThan(0);
+
+      const stopped = parseToolJson(
+        await client.callTool({ name: "stop_process", arguments: { id: procId } }),
+      );
+      expect(stopped.status).toBe("killed");
+      expect(await waitPidGone(bgGcPid)).toBe(true);
+    } finally {
+      for (const pid of [runGcPid, bgGcPid]) {
+        if (pid > 0) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // Already exited.
+          }
+        }
+      }
       await close();
     }
   });

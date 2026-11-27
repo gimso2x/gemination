@@ -146,11 +146,13 @@ export class ProcessManager {
   start(command: string, cwd: string): ManagedProcessInfo {
     this.pruneFinishedIfFull();
     const id = `proc_${randomBytes(6).toString("hex")}`;
+    const useProcessGroup = process.platform !== "win32";
     const proc = Bun.spawn(resolveShellCommand(command), {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
       env: buildSanitizedChildEnv(),
+      detached: useProcessGroup,
     });
 
     const entry: ManagedEntry = {
@@ -216,7 +218,9 @@ export class ProcessManager {
       const sig = force ? "SIGKILL" : "SIGTERM";
       entry.signal = sig;
       entry.status = "killed";
-      killProcessGracefully(entry.proc, force);
+      killProcessGracefully(entry.proc, force, process.platform, {
+        processGroup: process.platform !== "win32",
+      });
       entry.endedAt = new Date().toISOString();
     }
     return this.toInfo(entry);
@@ -227,11 +231,14 @@ export class ProcessManager {
   }
 
   stopAll(): void {
+    const useProcessGroup = process.platform !== "win32";
     for (const entry of this.entries.values()) {
       if (entry.status === "running") {
-        killProcessGracefully(entry.proc, true);
+        killProcessGracefully(entry.proc, true, process.platform, {
+          processGroup: useProcessGroup,
+        });
         entry.status = "killed";
-        entry.signal = "SIGTERM";
+        entry.signal = "SIGKILL";
         entry.endedAt = new Date().toISOString();
       }
     }

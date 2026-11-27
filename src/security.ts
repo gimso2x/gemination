@@ -259,10 +259,6 @@ const CATASTROPHIC_COMMAND_PATTERNS: Array<{ pattern: RegExp; reason: string }> 
     reason: "Fork bomb pattern is blocked",
   },
   {
-    pattern: /(^|[;&|\s])(shutdown|reboot|halt|poweroff)\b/,
-    reason: "System power/reboot commands are blocked",
-  },
-  {
     pattern: /(^|[;&|\s])diskutil\s+(eraseDisk|eraseVolume|partitionDisk|zeroDisk)\b/i,
     reason: "Destructive diskutil partition/erase commands are blocked",
   },
@@ -284,6 +280,183 @@ const CATASTROPHIC_COMMAND_PATTERNS: Array<{ pattern: RegExp; reason: string }> 
   },
 ];
 
+const POWER_COMMANDS = new Set(["shutdown", "shutdown.exe", "reboot", "halt", "poweroff"]);
+const SHELL_PREFIX_KEYWORDS = new Set(["then", "do", "else", "elif", "!"]);
+const COMMAND_WRAPPERS = new Set(["sudo", "doas", "env", "exec", "command", "nohup", "time"]);
+const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+function consumeBacktick(
+  input: string,
+  start: number,
+  insideDoubleQuote: boolean,
+): { out: string; nextIndex: number } {
+  const raw: string[] = [];
+  let i = start;
+  while (i < input.length) {
+    const ch = input[i]!;
+    if (ch === "\\") {
+      const next = input[i + 1];
+      if (next === undefined) {
+        i += 1;
+        break;
+      }
+      if (next === "`" || next === "\\" || next === "$" || (insideDoubleQuote && next === '"')) {
+        raw.push(next);
+      } else {
+        raw.push("\\", next);
+      }
+      i += 2;
+      continue;
+    }
+    if (ch === "`") {
+      i += 1;
+      break;
+    }
+    raw.push(ch);
+    i += 1;
+  }
+  return { out: stripNonExecutableQuotes(raw.join("")), nextIndex: i };
+}
+
+function consumeQuoted(
+  input: string,
+  start: number,
+  stopAtMatchingParen = false,
+): { out: string; nextIndex: number } {
+  const chunks: string[] = [];
+  let i = start;
+  let parenDepth = 0;
+
+  while (i < input.length) {
+    const ch = input[i]!;
+
+    if (stopAtMatchingParen) {
+      if (ch === "(") {
+        parenDepth += 1;
+        chunks.push(ch);
+        i += 1;
+        continue;
+      }
+      if (ch === ")") {
+        if (parenDepth === 0) {
+          return { out: chunks.join(""), nextIndex: i + 1 };
+        }
+        parenDepth -= 1;
+        chunks.push(ch);
+        i += 1;
+        continue;
+      }
+    }
+
+    if (ch === "\\") {
+      chunks.push(ch);
+      if (i + 1 < input.length) {
+        chunks.push(input[i + 1]!);
+        i += 2;
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === "'") {
+      chunks.push(" ");
+      i += 1;
+      while (i < input.length && input[i] !== "'") {
+        i += 1;
+      }
+      if (i < input.length && input[i] === "'") {
+        i += 1;
+      }
+      chunks.push(" ");
+      continue;
+    }
+
+    if (ch === '"') {
+      chunks.push(" ");
+      i += 1;
+      while (i < input.length && input[i] !== '"') {
+        const inner = input[i]!;
+        if (inner === "\\") {
+          i += i + 1 < input.length ? 2 : 1;
+          chunks.push(" ");
+          continue;
+        }
+        if (inner === "$" && input[i + 1] === "(") {
+          const subst = consumeQuoted(input, i + 2, true);
+          chunks.push(" ; ", subst.out, " ; ");
+          i = subst.nextIndex;
+          continue;
+        }
+        if (inner === "`") {
+          const bt = consumeBacktick(input, i + 1, true);
+          chunks.push(" ; ", bt.out, " ; ");
+          i = bt.nextIndex;
+          continue;
+        }
+        chunks.push(" ");
+        i += 1;
+      }
+      if (i < input.length && input[i] === '"') {
+        i += 1;
+      }
+      chunks.push(" ");
+      continue;
+    }
+
+    if (ch === "`") {
+      const bt = consumeBacktick(input, i + 1, false);
+      chunks.push(" ; ", bt.out, " ; ");
+      i = bt.nextIndex;
+      continue;
+    }
+
+    chunks.push(ch);
+    i += 1;
+  }
+
+  return { out: chunks.join(""), nextIndex: i };
+}
+
+function stripNonExecutableQuotes(command: string): string {
+  return consumeQuoted(command, 0, false).out;
+}
+
+function findFirstExecutableToken(segment: string): string | null {
+  const tokens = segment.trim().split(/\s+/).filter(Boolean);
+  let afterWrapper = false;
+  for (const token of tokens) {
+    if (SHELL_PREFIX_KEYWORDS.has(token)) {
+      afterWrapper = false;
+      continue;
+    }
+    if (ENV_ASSIGNMENT_RE.test(token)) {
+      continue;
+    }
+    if (afterWrapper && token.startsWith("-")) {
+      continue;
+    }
+    const base = token.replace(/^.*[/\\]/, "").toLowerCase();
+    if (COMMAND_WRAPPERS.has(base)) {
+      afterWrapper = true;
+      continue;
+    }
+    return base;
+  }
+  return null;
+}
+
+function hasDangerousPowerCommand(command: string): boolean {
+  const stripped = stripNonExecutableQuotes(command);
+  for (const segment of stripped.split(/[;&|\n()`]+/)) {
+    const cmd = findFirstExecutableToken(segment);
+    if (cmd && POWER_COMMANDS.has(cmd)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function checkCommandSafety(command: string): void {
   const trimmed = command.trim();
   if (!trimmed) {
@@ -297,6 +470,9 @@ export function checkCommandSafety(command: string): void {
     if (rule.pattern.test(trimmed) || rule.pattern.test(flattened)) {
       throw new SecurityError(`Blocked dangerous command: ${rule.reason}`);
     }
+  }
+  if (hasDangerousPowerCommand(trimmed) || hasDangerousPowerCommand(flattened)) {
+    throw new SecurityError("Blocked dangerous command: System power/reboot commands are blocked");
   }
 }
 

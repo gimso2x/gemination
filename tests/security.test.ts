@@ -108,6 +108,13 @@ describe("checkCommandSafety", () => {
     expect(() => checkCommandSafety("ls -la && git status")).not.toThrow();
     expect(() => checkCommandSafety("bun test tests")).not.toThrow();
     expect(() => checkCommandSafety("rm -rf ./dist")).not.toThrow();
+    expect(() => checkCommandSafety('git commit -m "fix graceful shutdown"')).not.toThrow();
+    expect(() => checkCommandSafety('git commit -m "fix; shutdown bug"')).not.toThrow();
+    expect(() => checkCommandSafety("git commit -m 'handle reboot cleanly'")).not.toThrow();
+    expect(() => checkCommandSafety("rg shutdown src/")).not.toThrow();
+    expect(() => checkCommandSafety("grep -n poweroff src/app.ts")).not.toThrow();
+    expect(() => checkCommandSafety('echo "halt and catch fire"')).not.toThrow();
+    expect(() => checkCommandSafety("bun run shutdown-helper.ts")).not.toThrow();
   });
 
   test("blocks catastrophic commands", () => {
@@ -118,6 +125,15 @@ describe("checkCommandSafety", () => {
     expect(() => checkCommandSafety(":(){ :|:& };:")).toThrow(SecurityError);
     expect(() => checkCommandSafety("dd if=/dev/zero of=/dev/disk0")).toThrow(SecurityError);
     expect(() => checkCommandSafety("shutdown -h now")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("/sbin/shutdown -h now")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("sudo shutdown -h now")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("sudo -n /usr/sbin/reboot")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("FOO=1 poweroff")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("echo ok && halt")).toThrow(SecurityError);
+    expect(() => checkCommandSafety("if true; then shutdown -h now; fi")).toThrow(SecurityError);
+    expect(() => checkCommandSafety('echo "$(reboot)"')).toThrow(SecurityError);
+    expect(() => checkCommandSafety('echo "`poweroff`"')).toThrow(SecurityError);
+    expect(() => checkCommandSafety("C:\\Windows\\System32\\shutdown.exe /s /t 0")).toThrow(SecurityError);
     expect(() => checkCommandSafety("Remove-Item -Recurse -Force C:\\")).toThrow(SecurityError);
     expect(() => checkCommandSafety("rd /s /q C:\\Windows")).toThrow(SecurityError);
     expect(() => checkCommandSafety("rd /q /s C:\\Windows")).toThrow(SecurityError);
